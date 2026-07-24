@@ -29,5 +29,3 @@ mss>=9.0.1
 # 安装后需要将 tesseract.exe 路径加入 PATH 或在设置中指定路径
 pytesseract>=0.3.10
 
-# 并发翻译
-concurrent-futures>=0.0.1

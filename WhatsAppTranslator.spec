@@ -48,7 +48,6 @@ a = Analysis(
         'matplotlib', 'numpy', 'scipy', 'pandas',
         'tkinter.test', 'unittest', 'test',
         'pydoc_data',
-        'tkinter',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

@@ -15,25 +15,24 @@ import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from config import get_app_dir
-
 
 def _setup_logging():
-    log_dir = get_app_dir() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fh = RotatingFileHandler(log_dir / "app.log", maxBytes=1_000_000,
-                              backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(fh)
-    root.addHandler(sh)
+    try:
+        from config import get_app_dir
+        log_dir = get_app_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fh = RotatingFileHandler(log_dir / "app.log", maxBytes=1_000_000,
+                                  backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(fh)
+    except Exception:
+        pass
 
 
 def _check_platform():
@@ -45,16 +44,29 @@ def _check_platform():
         sys.exit(1)
 
 
-def _excepthook(exc_type, exc_value, exc_tb):
-    logging.error("未捕获异常", exc_info=(exc_type, exc_value, exc_tb))
-    # 仍打印到控制台方便用户看到
-    traceback.print_exception(exc_type, exc_value, exc_tb)
+def _show_error_dialog(title: str, message: str):
+    """在无控制台模式下用 messagebox 显示错误。"""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message)
+        root.destroy()
+    except Exception:
+        # 连 tkinter 都起不来，只能写文件
+        try:
+            from config import get_app_dir
+            err_file = get_app_dir() / "crash.log"
+            with open(err_file, "w", encoding="utf-8") as f:
+                f.write(f"{title}\n\n{message}")
+        except Exception:
+            pass
 
 
 def main():
     _check_platform()
     _setup_logging()
-    sys.excepthook = _excepthook
 
     # 在 Windows 上，tkinter 需要 DPI 感知
     try:
@@ -63,12 +75,17 @@ def main():
     except Exception:
         pass
 
-    import tkinter as tk
-    from gui import TranslatorApp
+    try:
+        import tkinter as tk
+        from gui import TranslatorApp
 
-    root = tk.Tk()
-    TranslatorApp(root)
-    root.mainloop()
+        root = tk.Tk()
+        TranslatorApp(root)
+        root.mainloop()
+    except Exception as e:
+        tb = traceback.format_exc()
+        logging.error("启动失败: %s", tb)
+        _show_error_dialog("程序启动失败", f"{e}\n\n{tb}")
 
 
 if __name__ == "__main__":
