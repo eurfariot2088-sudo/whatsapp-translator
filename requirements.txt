@@ -1,0 +1,33 @@
+# Windows 桌面 WhatsApp 翻译软件依赖
+# Python >= 3.9
+
+# UI Automation - 自动读取 WhatsApp 窗口消息（不截屏）
+uiautomation>=2.0.18
+comtypes>=1.2.0
+
+# 翻译后端
+deep-translator>=1.11.4
+requests>=2.31.0
+
+# GUI
+# tkinter 为 Python 内置，无需安装
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# 全局热键
+keyboard>=0.13.5
+
+# 配置持久化
+pyyaml>=6.0.1
+
+# 截图翻译 - 快速截屏
+mss>=9.0.1
+
+# OCR 文字识别（截图翻译用）
+# 注意：还需要安装 Tesseract-OCR 引擎本身
+# 下载地址：https://github.com/UB-Mannheim/tesseract/wiki
+# 安装后需要将 tesseract.exe 路径加入 PATH 或在设置中指定路径
+pytesseract>=0.3.10
+
+# 并发翻译
+concurrent-futures>=0.0.1
