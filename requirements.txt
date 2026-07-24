@@ -1,0 +1,25 @@
+# Windows 桌面 WhatsApp 翻译软件依赖
+# Python >= 3.9
+
+# UI Automation - 自动读取 WhatsApp 窗口消息（不截屏）
+uiautomation>=2.0.18
+# 用于将控件 TreeWalker 包装得更好用
+comtypes>=1.2.0
+
+# 翻译后端
+# Google 翻译（免费，无需 API Key，走 deep-translator 稳定通道）
+deep-translator>=1.11.4
+# 豆包（Volcano ARK）走标准 HTTPS，无需额外 SDK
+requests>=2.31.0
+
+# GUI
+# tkinter 为 Python 内置，无需安装
+# 系统托盘
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# 全局热键（可选，用于「翻译剪贴板」「切换窗口」等）
+keyboard>=0.13.5
+
+# 配置持久化
+pyyaml>=6.0.1
