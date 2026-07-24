@@ -15,24 +15,23 @@ PyInstaller 打包配置文件。
 
 import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+import yaml
 
 block_cipher = None
 
-# ---- 收集动态导入的子模块 ----
 hiddenimports = []
-hiddenimports += collect_submodules('deep_translator')      # Google/各翻译通道
-hiddenimports += collect_submodules('pystray')               # 托盘后端
-hiddenimports += collect_submodules('PIL')                   # Pillow
-hiddenimports += collect_submodules('keyboard')              # 全局热键
-hiddenimports += collect_submodules('uiautomation')          # UI Automation
-hiddenimports += collect_submodules('comtypes')              # UIA 依赖
-hiddenimports += collect_submodules('yaml')                  # 配置文件
-hiddenimports += collect_submodules('requests')              # HTTP
+hiddenimports += collect_submodules('deep_translator')
+hiddenimports += collect_submodules('pystray')
+hiddenimports += collect_submodules('PIL')
+hiddenimports += collect_submodules('keyboard')
+hiddenimports += collect_submodules('uiautomation')
+hiddenimports += collect_submodules('comtypes')
+hiddenimports += collect_submodules('requests')
+hiddenimports += collect_submodules('mss')
+hiddenimports += collect_submodules('pytesseract')
 
-# pystray 在 Windows 上走 PIL 后端
+hiddenimports += ['yaml']
 hiddenimports += ['pystray._win32', 'pystray._util']
-
-# deep-translator 内部按需 import，确保全部打入
 hiddenimports += [
     'deep_translator.google',
     'deep_translator.base',
