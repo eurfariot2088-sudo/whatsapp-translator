@@ -102,12 +102,23 @@ def show_region_selector(parent_tk, callback):
     screen_w = screen_img.width
     screen_h = screen_img.height
 
+    # 创建浅色蒙层版本（在原截图上叠加半透明白色）
+    from PIL import ImageEnhance
+    overlay_img = Image.new("RGBA", (screen_w, screen_h), (255, 255, 255, 60))
+    dimmed = Image.alpha_composite(screen_img.convert("RGBA"), overlay_img)
+    # 转回 RGB 用于 PhotoImage
+    dimmed = dimmed.convert("RGB")
+
     canvas = tk.Canvas(overlay, width=screen_w, height=screen_h,
-                       highlightthickness=0, bd=0, bg="black")
+                       highlightthickness=0, bd=0, bg="#888888")
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    tk_img = ImageTk.PhotoImage(screen_img)
+    # 显示带浅色蒙层的截图
+    tk_img = ImageTk.PhotoImage(dimmed)
     canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+
+    # 保存原始截图用于选区内显示
+    tk_orig = ImageTk.PhotoImage(screen_img)
 
     # 提示
     canvas.create_text(
@@ -117,23 +128,39 @@ def show_region_selector(parent_tk, callback):
     )
 
     # 状态
-    state = {"start_x": 0, "start_y": 0, "rect_id": None}
+    state = {"start_x": 0, "start_y": 0, "rect_id": None, "orig_id": None}
 
     def on_press(event):
         state["start_x"] = event.x
         state["start_y"] = event.y
         if state["rect_id"]:
             canvas.delete(state["rect_id"])
+        if state["orig_id"]:
+            canvas.delete(state["orig_id"])
+        # 选框内的原图（亮色显示）
+        state["orig_id"] = canvas.create_image(event.x, event.y, anchor=tk.NW, image=tk_orig)
         state["rect_id"] = canvas.create_rectangle(
             event.x, event.y, event.x, event.y,
-            outline="red", width=3,
+            outline="#FF0000", width=3,
         )
+        # 把选框提到最上层
+        canvas.tag_raise(state["rect_id"])
 
     def on_drag(event):
+        x1 = min(state["start_x"], event.x)
+        y1 = min(state["start_y"], event.y)
+        x2 = max(state["start_x"], event.x)
+        y2 = max(state["start_y"], event.y)
         if state["rect_id"]:
-            canvas.coords(state["rect_id"],
-                          state["start_x"], state["start_y"],
-                          event.x, event.y)
+            canvas.coords(state["rect_id"], x1, y1, x2, y2)
+        if state["orig_id"]:
+            # 裁剪选区内的原图并显示
+            crop = screen_img.crop((x1, y1, x2, y2))
+            crop_tk = ImageTk.PhotoImage(crop)
+            canvas.delete(state["orig_id"])
+            state["orig_id"] = canvas.create_image(x1, y1, anchor=tk.NW, image=crop_tk)
+            state["crop_tk"] = crop_tk  # 防止 GC
+            canvas.tag_raise(state["rect_id"])
 
     def on_release(event):
         x1 = min(state["start_x"], event.x)

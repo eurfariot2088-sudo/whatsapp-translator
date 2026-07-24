@@ -78,7 +78,7 @@ class TranslatorConfig:
 class ReaderConfig:
     """WhatsApp 读取相关配置。"""
 
-    process_name: str = "WhatsApp.exe"
+    process_name: str = "WhatsApp"
     window_keyword: str = "WhatsApp"
     # 轮询频率（秒）—— 降低到 0.8 秒以支持实时翻译
     poll_interval: float = 0.8

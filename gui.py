@@ -1,11 +1,12 @@
 """
 gui.py
-微信式对话气泡界面 —— v4
+微信式对话气泡界面 —— v5
 
-核心修复：
-1. 截图翻译在主线程运行（用 Toplevel 不跨线程）
-2. 底部文本框自动翻译（KeyRelease 事件 + 防抖）
-3. 消息显示简化，确保翻译结果正确
+核心改进：
+- 可见调试日志面板（底部折叠面板，显示 Reader 运行状态）
+- 连接 on_debug 回调，实时显示窗口查找/消息提取状态
+- 截图翻译在主线程运行
+- 底部文本框自动翻译（KeyRelease + 防抖）
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ class ChatBubble(tk.Frame):
     def __init__(self, parent, text: str, direction: str, colors: dict,
                  font_family="Microsoft YaHei", font_size=11, on_copy=None):
         super().__init__(parent, bg=colors["chat_bg"])
-        self._on_copy = on_copy
         self._colors = colors
         self._font_family = font_family
         self._font_size = font_size
@@ -47,14 +47,12 @@ class ChatBubble(tk.Frame):
         bubble_bg = colors["bubble_in"] if is_in else colors["bubble_out"]
         text_fg = colors["text_in"] if is_in else colors["text_out"]
 
-        # 行容器
         row = tk.Frame(self, bg=colors["chat_bg"])
         row.pack(fill=tk.X, padx=8, pady=3)
 
-        # 气泡
         bubble = tk.Frame(row, bg=bubble_bg, padx=12, pady=8)
 
-        # 原文
+        self._bubble_bg = bubble_bg
         self._lbl_orig = tk.Label(
             bubble, text=text, font=(font_family, font_size),
             fg=text_fg, bg=bubble_bg, justify=tk.LEFT,
@@ -62,12 +60,10 @@ class ChatBubble(tk.Frame):
         )
         self._lbl_orig.pack(fill=tk.X, anchor=tk.W)
 
-        # 译文区域（初始为空，翻译完成后更新）
         self._trans_frame = tk.Frame(bubble, bg=bubble_bg)
         self._trans_frame.pack(fill=tk.X, anchor=tk.W)
-        self._lbl_trans = None  # 延迟创建
+        self._lbl_trans = None
 
-        # 复制按钮
         if on_copy:
             lbl_copy = tk.Label(
                 bubble, text="复制", font=(font_family, 8),
@@ -76,7 +72,6 @@ class ChatBubble(tk.Frame):
             lbl_copy.pack(anchor=tk.E, pady=(2, 0))
             lbl_copy.bind("<Button-1>", lambda e: on_copy(text))
 
-        # 时间
         time_str = time.strftime("%H:%M")
         lbl_time = tk.Label(row, text=time_str, font=(font_family, 8),
                             fg="#999999", bg=colors["chat_bg"])
@@ -89,26 +84,19 @@ class ChatBubble(tk.Frame):
             lbl_time.pack(side=tk.RIGHT, padx=(0, 4), anchor=tk.S)
 
     def set_translation(self, text: str):
-        """设置译文。"""
         if self._lbl_trans is not None:
             self._lbl_trans.destroy()
             self._lbl_trans = None
         if not text or not text.strip():
             return
-        # 分隔线
-        sep = tk.Frame(self._trans_frame, bg=self._colors["trans_line"], height=1)
+        sep = tk.Frame(self._trans_frame, bg=self._bubble_bg, height=1)
         sep.pack(fill=tk.X, pady=(6, 3))
         self._lbl_trans = tk.Label(
             self._trans_frame, text=text,
             font=(self._font_family, self._font_size - 1),
-            fg=self._colors["trans_text"], bg=self._colors["bubble_in"] if self._lbl_orig.cget("bg") == "#FFFFFF" else self._colors["bubble_out"],
+            fg=self._colors["trans_text"], bg=self._bubble_bg,
             justify=tk.LEFT, wraplength=460, anchor=tk.W,
         )
-        # 使用气泡背景色
-        bg = self._lbl_orig.cget("bg")
-        self._lbl_trans.configure(bg=bg)
-        self._trans_frame.configure(bg=bg)
-        sep.configure(bg=bg)
         self._lbl_trans.pack(fill=tk.X, anchor=tk.W)
 
 
@@ -123,8 +111,7 @@ class TranslatorApp:
         self.running = False
 
         self._msg_map: Dict[str, ChatBubble] = {}
-        self._msg_order: List[str] = []
-        self._last_fp_set = set()
+        self._last_fp_set: set = set()
 
         self._colors = {
             "chat_bg": "#F5F5F5",
@@ -137,10 +124,8 @@ class TranslatorApp:
         }
         self._font_family = "Microsoft YaHei"
         self._font_size = 11
-
-        # 底部自动翻译防抖
         self._reply_timer = None
-        self._reply_translating = False
+        self._debug_lines: List[str] = []
 
         self._build_ui()
         self._poll_queue()
@@ -151,9 +136,9 @@ class TranslatorApp:
 
     # ==================== UI ====================
     def _build_ui(self):
-        self.root.title("WhatsApp 翻译助手")
-        self.root.geometry("960x720")
-        self.root.minsize(720, 540)
+        self.root.title("WhatsApp 翻译助手 v5")
+        self.root.geometry("960x780")
+        self.root.minsize(720, 600)
 
         # ===== 顶部工具栏 =====
         bar = ttk.Frame(self.root, padding=(8, 6))
@@ -162,29 +147,29 @@ class TranslatorApp:
         ttk.Label(bar, text="源语言:").pack(side=tk.LEFT, padx=(0, 4))
         self.var_src = tk.StringVar(value="自动检测 (auto)")
         src_vals = [f"{n} ({c})" for c, n in get_language_list()]
-        ttk.Combobox(bar, textvariable=self.var_src, values=src_vals,
-                     state="readonly", width=16).pack(side=tk.LEFT, padx=(0, 12))
-        self.cb_src = bar.winfo_children()[-1]
+        self.cb_src = ttk.Combobox(bar, textvariable=self.var_src, values=src_vals,
+                                    state="readonly", width=16)
+        self.cb_src.pack(side=tk.LEFT, padx=(0, 12))
         self.cb_src.bind("<<ComboboxSelected>>", self._on_src_changed)
 
         ttk.Label(bar, text="目标语言:").pack(side=tk.LEFT, padx=(0, 4))
         self.var_tgt = tk.StringVar(value="中文（简体）(zh-CN)")
         tgt_vals = [f"{n} ({c})" for c, n in get_language_list() if c != "auto"]
-        ttk.Combobox(bar, textvariable=self.var_tgt, values=tgt_vals,
-                     state="readonly", width=18).pack(side=tk.LEFT, padx=(0, 12))
-        self.cb_tgt = bar.winfo_children()[-1]
+        self.cb_tgt = ttk.Combobox(bar, textvariable=self.var_tgt, values=tgt_vals,
+                                    state="readonly", width=18)
+        self.cb_tgt.pack(side=tk.LEFT, padx=(0, 12))
         self.cb_tgt.bind("<<ComboboxSelected>>", self._on_tgt_changed)
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
         self.btn_toggle = ttk.Button(bar, text="▶ 开始监听", width=12, command=self._toggle)
         self.btn_toggle.pack(side=tk.LEFT)
-        ttk.Button(bar, text="🧹 清空", width=8, command=self._clear).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(bar, text="📸 截图翻译", width=12, command=self._screenshot).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(bar, text="⏏ 退出", width=8, command=self._quit).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="清空", width=6, command=self._clear).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text="截图翻译", width=10, command=self._screenshot).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text="退出", width=6, command=self._quit).pack(side=tk.RIGHT)
 
         # ===== 聊天标题 =====
-        title_bar = tk.Frame(self.root, bg="#FFFFFF", height=32)
+        title_bar = tk.Frame(self.root, bg="#FFFFFF", height=30)
         title_bar.pack(fill=tk.X)
         title_bar.pack_propagate(False)
         self.lbl_title = tk.Label(title_bar, text="未开始监听",
@@ -219,25 +204,65 @@ class TranslatorApp:
         reply_vals = [f"{n} ({c})" for c, n in get_language_list() if c != "auto"]
         ttk.Combobox(r1, textvariable=self.var_reply_lang, values=reply_vals,
                      state="readonly", width=22).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Button(r1, text="📋 复制译文", command=self._copy_reply).pack(side=tk.RIGHT)
+        ttk.Button(r1, text="复制译文", command=self._copy_reply).pack(side=tk.RIGHT)
 
-        # 输入框
-        self.reply_input = tk.Text(rf, height=3, font=(self._font_family, self._font_size), wrap=tk.WORD)
+        self.reply_input = tk.Text(rf, height=2, font=(self._font_family, self._font_size), wrap=tk.WORD)
         self.reply_input.pack(fill=tk.X, pady=(0, 4))
-        # 绑定 KeyRelease 实现自动翻译
         self.reply_input.bind("<KeyRelease>", self._on_reply_input)
 
-        # 译文输出框
         ttk.Label(rf, text="译文:").pack(anchor=tk.W)
-        self.reply_output = tk.Text(rf, height=3, font=(self._font_family, self._font_size),
+        self.reply_output = tk.Text(rf, height=2, font=(self._font_family, self._font_size),
                                     wrap=tk.WORD, bg="#F9F9F9")
         self.reply_output.pack(fill=tk.X, pady=(2, 4))
         self.reply_output.configure(state=tk.DISABLED)
+
+        # ===== 调试日志面板（可折叠） =====
+        self._debug_visible = True
+        debug_frame = ttk.LabelFrame(self.root, text="调试日志", padding=(4, 2))
+        debug_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 0))
+
+        r2 = ttk.Frame(debug_frame)
+        r2.pack(fill=tk.X)
+        ttk.Button(r2, text="展开/收起", width=10, command=self._toggle_debug).pack(side=tk.LEFT)
+        ttk.Button(r2, text="清空日志", width=8, command=self._clear_debug).pack(side=tk.LEFT, padx=(4, 0))
+        self.lbl_debug_status = ttk.Label(r2, text="等待启动...", foreground="blue")
+        self.lbl_debug_status.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.debug_text = tk.Text(debug_frame, height=6, font=("Consolas", 9),
+                                   bg="#1E1E1E", fg="#00FF00", insertbackground="#00FF00",
+                                   wrap=tk.WORD, state=tk.DISABLED)
+        self.debug_text.pack(fill=tk.X, pady=(2, 0))
 
         # 状态栏
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.var_status, anchor=tk.W,
                   padding=(8, 3), relief=tk.SUNKEN).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _toggle_debug(self):
+        if self._debug_visible:
+            self.debug_text.pack_forget()
+            self._debug_visible = False
+        else:
+            self.debug_text.pack(fill=tk.X, pady=(2, 0))
+            self._debug_visible = True
+
+    def _clear_debug(self):
+        self._debug_lines.clear()
+        self.debug_text.configure(state=tk.NORMAL)
+        self.debug_text.delete("1.0", tk.END)
+        self.debug_text.configure(state=tk.DISABLED)
+
+    def _append_debug(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self._debug_lines.append(line)
+        if len(self._debug_lines) > 200:
+            self._debug_lines = self._debug_lines[-100:]
+        self.debug_text.configure(state=tk.NORMAL)
+        self.debug_text.insert(tk.END, line + "\n")
+        self.debug_text.see(tk.END)
+        self.debug_text.configure(state=tk.DISABLED)
+        self.lbl_debug_status.configure(text=msg[:80])
 
     # ==================== 语言切换 ====================
     def _parse_code(self, display: str) -> str:
@@ -265,29 +290,34 @@ class TranslatorApp:
             return
         try:
             from config import ReaderConfig
-            cfg = ReaderConfig(poll_interval=0.6, max_history=1000, min_length=1)
-            self.reader = WhatsAppReader(cfg, on_messages=self._on_msgs, on_chat_changed=self._on_chat)
+            cfg = ReaderConfig(poll_interval=0.8, max_history=1000, min_length=1)
+            self.reader = WhatsAppReader(
+                cfg,
+                on_messages=self._on_msgs,
+                on_chat_changed=self._on_chat,
+                on_debug=self._on_debug,
+            )
         except RuntimeError as e:
             messagebox.showerror("错误", str(e))
             return
         self.reader.start()
         self.running = True
-        self.btn_toggle.configure(text="⏸ 暂停")
+        self.btn_toggle.configure(text="暂停")
         self._set_status("正在监听 WhatsApp...")
         self.lbl_title.configure(text="监听中...")
+        self._append_debug("=== 开始监听 ===")
 
     def _stop(self):
         if self.reader:
             self.reader.stop()
         self.running = False
-        self.btn_toggle.configure(text="▶ 开始监听")
+        self.btn_toggle.configure(text="开始监听")
         self._set_status("已暂停")
 
     def _clear(self):
         for w in self.scroll_frame.winfo_children():
             w.destroy()
         self._msg_map.clear()
-        self._msg_order.clear()
         self._last_fp_set.clear()
         self._set_status("已清空")
 
@@ -297,6 +327,9 @@ class TranslatorApp:
 
     def _on_chat(self, title: str):
         _post("chat", title)
+
+    def _on_debug(self, msg: str):
+        _post("debug", msg)
 
     # ==================== 队列消费 ====================
     def _poll_queue(self):
@@ -312,37 +345,31 @@ class TranslatorApp:
                     self._handle_trans(fp, text)
                 elif kind == "reply":
                     self._handle_reply_result(payload)
+                elif kind == "debug":
+                    self._append_debug(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
 
     def _handle_chat(self, title: str):
-        self.lbl_title.configure(text=f"💬 {title}")
+        self.lbl_title.configure(text=f"聊天: {title}")
         self._clear()
         self._set_status(f"切换到: {title}")
 
     def _handle_msgs(self, msgs: List[WhatsAppMessage]):
         if not msgs:
             return
-
-        current_fps = [m.fingerprint() for m in msgs]
-        current_set = set(current_fps)
-
-        # 如果消息集合完全相同，不处理
+        current_set = {m.fingerprint() for m in msgs}
         if current_set == self._last_fp_set:
-            # 检查是否有新消息
-            pass
-        else:
-            # 有变化，处理新消息
-            for msg in msgs:
-                fp = msg.fingerprint()
-                if fp not in self._msg_map:
-                    self._add_bubble(msg, fp)
+            return
 
-            self._last_fp_set = current_set
+        for msg in msgs:
+            fp = msg.fingerprint()
+            if fp not in self._msg_map:
+                self._add_bubble(msg, fp)
+        self._last_fp_set = current_set
 
     def _add_bubble(self, msg: WhatsAppMessage, fp: str):
-        """添加气泡并启动翻译。"""
         bubble = ChatBubble(
             self.scroll_frame, msg.text, msg.direction,
             self._colors, self._font_family, self._font_size,
@@ -351,7 +378,6 @@ class TranslatorApp:
         bubble.pack(fill=tk.X, padx=8, pady=2)
         self._msg_map[fp] = bubble
 
-        # 异步翻译
         def cb(result):
             if isinstance(result, Exception):
                 trans = f"[翻译失败] {result}"
@@ -367,7 +393,6 @@ class TranslatorApp:
             source=self.translator.source_lang,
             callback=cb,
         )
-
         self.root.after(10, self._scroll_bottom)
 
     def _handle_trans(self, fp: str, text: str):
@@ -389,7 +414,6 @@ class TranslatorApp:
 
     # ==================== 底部自动翻译 ====================
     def _on_reply_input(self, event=None):
-        """输入框 KeyRelease 事件 — 自动翻译（防抖 500ms）。"""
         if self._reply_timer:
             self.root.after_cancel(self._reply_timer)
         self._reply_timer = self.root.after(500, self._do_reply_translate)
@@ -401,7 +425,6 @@ class TranslatorApp:
             self.reply_output.delete("1.0", tk.END)
             self.reply_output.configure(state=tk.DISABLED)
             return
-
         lang = self._parse_code(self.var_reply_lang.get())
 
         def cb(result):
@@ -431,9 +454,8 @@ class TranslatorApp:
         except Exception:
             pass
 
-    # ==================== 截图翻译（主线程） ====================
+    # ==================== 截图翻译 ====================
     def _screenshot(self):
-        """截图翻译 — 在主线程运行。"""
         self._set_status("截图翻译：请框选区域...")
         try:
             from screenshot import start_screenshot_translate
