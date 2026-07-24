@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 WhatsAppTranslator.spec
-PyInstaller 打包配置文件（onedir 模式，更稳定）。
+PyInstaller 打包配置文件（onedir 模式）。
 
 用法：
     pyinstaller --noconfirm --clean WhatsAppTranslator.spec
@@ -10,43 +10,47 @@ PyInstaller 打包配置文件（onedir 模式，更稳定）。
     dist/WhatsAppTranslator/WhatsAppTranslator.exe
 """
 
-import sys
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
-
 block_cipher = None
-
-hiddenimports = []
-datas = []
-binaries = []
-
-# 收集所有依赖
-for pkg in ['deep_translator', 'pystray', 'PIL', 'keyboard', 'uiautomation',
-            'comtypes', 'requests', 'yaml', 'mss', 'pytesseract']:
-    h, d, b = collect_all(pkg)
-    hiddenimports += h
-    datas += d
-    binaries += b
-
-hiddenimports += [
-    'pystray._win32',
-    'pystray._util',
-    'deep_translator.google',
-    'yaml',
-    'yaml._yaml',
-]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=[],
+    datas=[],
+    hiddenimports=[
+        'deep_translator',
+        'deep_translator.google',
+        'deep_translator.base',
+        'deep_translator.constants',
+        'deep_translator.validate',
+        'pystray',
+        'pystray._win32',
+        'pystray._util',
+        'PIL',
+        'keyboard',
+        'uiautomation',
+        'comtypes',
+        'comtypes.client',
+        'requests',
+        'yaml',
+        'yaml._yaml',
+        'mss',
+        'pytesseract',
+        'tkinter',
+        'tkinter.ttk',
+        'tkinter.messagebox',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'matplotlib', 'numpy', 'scipy', 'pandas',
-        'tkinter.test', 'unittest', 'test',
+        'matplotlib',
+        'numpy',
+        'scipy',
+        'pandas',
+        'tkinter.test',
+        'unittest',
+        'test',
         'pydoc_data',
     ],
     win_no_prefer_redirects=False,
