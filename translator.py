@@ -1,26 +1,26 @@
 """
 translator.py
-翻译引擎抽象层。
-- Google 后端：基于 deep-translator（GoogleTranslate 免费通道，无需 Key）
-- 豆包 后端：基于火山引擎 ARK Chat Completions（OpenAI 兼容协议），需 API Key
+翻译引擎 —— 基于 Google 翻译（deep-translator），质量稳定支持 100+ 语言。
 
-支持：
-- 同步翻译 translate()
-- 并发翻译 translate_batch()（用线程池加速多条消息）
-- 本地缓存，重复消息秒回
+支持的目标语言（常见 11 种）：
+  英语 en, 葡萄牙语 pt, 西班牙语 es, 俄语 ru, 阿拉伯语 ar,
+  韩语 ko, 日语 ja, 马来语 ms, 法语 fr, 土耳其语 tr, 泰语 th, 越南语 vi
+
+功能：
+- Google 翻译后端（高质量）
+- 本地 LRU 缓存
+- 并发批量翻译（线程池）
+- 自动识别源语言
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional
-
-import requests
-
-from config import TranslatorConfig
+from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class TranslationResult:
     text: str
-    src: str
+    src_lang: str
     backend: str
     elapsed_ms: int
 
@@ -37,145 +37,107 @@ class TranslateError(Exception):
     pass
 
 
-# ---------------------------------------------------------------------------
-# 工具：判断是否需要翻译
-# ---------------------------------------------------------------------------
-_CJK_RANGES = (
-    (0x3040, 0x30FF),
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-)
+# Google 翻译支持的语言代码
+# key = 语言代码, value = 中文名
+GOOGLE_LANGUAGES: Dict[str, str] = {
+    "auto": "自动检测",
+    "en": "英语",
+    "pt": "葡萄牙语",
+    "es": "西班牙语",
+    "ru": "俄语",
+    "ar": "阿拉伯语",
+    "ko": "韩语",
+    "ja": "日语",
+    "ms": "马来语",
+    "fr": "法语",
+    "tr": "土耳其语",
+    "th": "泰语",
+    "vi": "越南语",
+    "zh-CN": "中文（简体）",
+    "zh-TW": "中文（繁体）",
+    "de": "德语",
+    "it": "意大利语",
+    "nl": "荷兰语",
+    "pl": "波兰语",
+    "id": "印尼语",
+    "hi": "印地语",
+}
 
 
-def _has_cjk(s: str) -> bool:
-    return any(any(a <= ord(c) <= b for a, b in _CJK_RANGES) for c in s)
+def get_language_list() -> List[tuple]:
+    """返回 (code, name) 列表，用于下拉框。"""
+    return list(GOOGLE_LANGUAGES.items())
 
 
-def needs_translation(text: str, target_lang: str) -> bool:
-    if not text or not text.strip():
-        return False
-    target_is_zh = target_lang.lower().startswith("zh")
-    if target_is_zh and _has_cjk(text):
-        return False
-    if not target_is_zh and text.isascii():
-        return False
-    return True
-
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Google 翻译后端
-# ---------------------------------------------------------------------------
+# ============================================================================
 class GoogleBackend:
     name = "google"
 
-    def __init__(self, cfg: TranslatorConfig):
-        self.cfg = cfg
+    def __init__(self):
         from deep_translator import GoogleTranslator  # type: ignore
-        self._GoogleTranslator = GoogleTranslator
+        self._GT = GoogleTranslator
+        self._instances: Dict[str, object] = {}
+        self._lock = threading.Lock()
 
-    def translate(self, text: str, target: str = "", source: str = "") -> TranslationResult:
-        tgt = target or self.cfg.target_lang
-        src = source or self.cfg.source_lang or "auto"
+    def _get_translator(self, source: str, target: str):
+        key = f"{source}:{target}"
+        with self._lock:
+            if key not in self._instances:
+                self._instances[key] = self._GT(source=source, target=target)
+                # 限制缓存大小
+                if len(self._instances) > 50:
+                    # 清空一半
+                    keys = list(self._instances.keys())
+                    for k in keys[:25]:
+                        del self._instances[k]
+            return self._instances[key]
+
+    def translate(self, text: str, target: str = "zh-CN", source: str = "auto") -> TranslationResult:
         t0 = time.time()
         try:
-            tr = self._GoogleTranslator(source=src, target=tgt)
+            tr = self._get_translator(source, target)
             out = tr.translate(text)
         except Exception as e:
-            raise TranslateError(f"Google 翻译失败: {e}") from e
+            # 尝试重建 translator 实例（可能是连接超时）
+            try:
+                key = f"{source}:{target}"
+                with self._lock:
+                    if key in self._instances:
+                        del self._instances[key]
+                tr = self._get_translator(source, target)
+                out = tr.translate(text)
+            except Exception as e2:
+                raise TranslateError(f"Google 翻译失败: {e2}") from e2
+
+        elapsed = int((time.time() - t0) * 1000)
         return TranslationResult(
             text=out or "",
-            src=src,
+            src_lang=source,
             backend=self.name,
-            elapsed_ms=int((time.time() - t0) * 1000),
+            elapsed_ms=elapsed,
         )
 
 
-# ---------------------------------------------------------------------------
-# 豆包翻译后端
-# ---------------------------------------------------------------------------
-DOUBAO_SYSTEM_PROMPT = (
-    "你是一个专业翻译引擎。只输出译文本身，不要添加任何解释、注释、引号或前后缀。"
-    "如果原文已经是目标语言，请原样返回。"
-)
-
-
-class DoubaoBackend:
-    name = "doubao"
-
-    def __init__(self, cfg: TranslatorConfig):
-        self.cfg = cfg
-        if not cfg.doubao_api_key:
-            raise TranslateError("豆包后端需要在 config.yaml 中配置 doubao_api_key")
-
-    def translate(self, text: str, target: str = "", source: str = "") -> TranslationResult:
-        tgt = target or self.cfg.target_lang
-        t0 = time.time()
-        user_prompt = f"请将下面的文本翻译为 {tgt}：\n\n{text}"
-        payload = {
-            "model": self.cfg.doubao_model,
-            "messages": [
-                {"role": "system", "content": DOUBAO_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.cfg.doubao_api_key}",
-            "Content-Type": "application/json",
-        }
-        try:
-            resp = requests.post(
-                self.cfg.doubao_endpoint,
-                headers=headers,
-                json=payload,
-                timeout=self.cfg.doubao_timeout,
-            )
-        except requests.RequestException as e:
-            raise TranslateError(f"豆包请求失败: {e}") from e
-
-        if resp.status_code != 200:
-            raise TranslateError(f"豆包 HTTP {resp.status_code}: {resp.text[:200]}")
-
-        try:
-            data = resp.json()
-            out = data["choices"][0]["message"]["content"].strip()
-        except (KeyError, ValueError, IndexError) as e:
-            raise TranslateError(f"豆包响应解析失败: {e}; body={resp.text[:200]}") from e
-
-        return TranslationResult(
-            text=out,
-            src="auto",
-            backend=self.name,
-            elapsed_ms=int((time.time() - t0) * 1000),
-        )
-
-
-# ---------------------------------------------------------------------------
-# 顶层 Translator（带缓存 + 并发批量翻译）
-# ---------------------------------------------------------------------------
+# ============================================================================
+# 顶层 Translator（带缓存 + 并发）
+# ============================================================================
 class Translator:
-    def __init__(self, cfg: TranslatorConfig):
-        self.cfg = cfg
-        self._backend = self._build_backend(cfg)
-        self._cache: dict[str, str] = {}
-        self._cache_lock = __import__("threading").Lock()
-        self._cache_limit = 1024
-        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="translator")
+    def __init__(self, target_lang: str = "zh-CN", source_lang: str = "auto"):
+        self.target_lang = target_lang
+        self.source_lang = source_lang
+        self._backend = GoogleBackend()
+        self._cache: Dict[str, str] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_limit = 2048
+        self._executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="translator")
 
-    @staticmethod
-    def _build_backend(cfg: TranslatorConfig):
-        if cfg.backend == "google":
-            return GoogleBackend(cfg)
-        if cfg.backend == "doubao":
-            return DoubaoBackend(cfg)
-        raise TranslateError(f"未知翻译后端: {cfg.backend}")
+    def set_target(self, lang: str):
+        self.target_lang = lang
 
-    def switch_backend(self, new_cfg: TranslatorConfig):
-        self.cfg = new_cfg
-        self._backend = self._build_backend(new_cfg)
-        with self._cache_lock:
-            self._cache.clear()
+    def set_source(self, lang: str):
+        self.source_lang = lang
 
     def _cache_get(self, key: str) -> Optional[str]:
         with self._cache_lock:
@@ -184,74 +146,114 @@ class Translator:
     def _cache_put(self, key: str, val: str):
         with self._cache_lock:
             if len(self._cache) >= self._cache_limit:
-                for _ in range(64):
-                    if self._cache:
-                        self._cache.pop(next(iter(self._cache)), None)
+                # 淘汰 1/4
+                keys = list(self._cache.keys())
+                for k in keys[:self._cache_limit // 4]:
+                    self._cache.pop(k, None)
             self._cache[key] = val
 
     def translate(self, text: str, target: str = "", source: str = "") -> Optional[TranslationResult]:
-        """同步翻译单条文本。返回 None 表示无需翻译。"""
-        tgt = target or self.cfg.target_lang
-        if not needs_translation(text, tgt):
+        """同步翻译。返回 None 表示无需翻译（已是目标语言）。"""
+        tgt = target or self.target_lang
+        src = source or self.source_lang
+
+        text = (text or "").strip()
+        if not text:
             return None
-        cache_key = f"{tgt}:{text}"
+
+        # 快速判断：如果目标是中文且文本全是中文，跳过
+        if tgt.startswith("zh") and self._is_chinese(text):
+            return None
+
+        cache_key = f"{src}:{tgt}:{text}"
         cached = self._cache_get(cache_key)
         if cached is not None:
-            return TranslationResult(text=cached, src="cache",
-                                     backend=self._backend.name, elapsed_ms=0)
-        last_err: Optional[Exception] = None
+            return TranslationResult(text=cached, src_lang=src,
+                                     backend="cache", elapsed_ms=0)
+
+        last_err = None
         for attempt in range(2):
             try:
-                result = self._backend.translate(text, target=tgt, source=source)
-                self._cache_put(cache_key, result.text)
+                result = self._backend.translate(text, target=tgt, source=src)
+                if result and result.text:
+                    self._cache_put(cache_key, result.text)
                 return result
             except TranslateError as e:
                 last_err = e
                 log.warning("翻译失败（第 %d 次）: %s", attempt + 1, e)
-                time.sleep(0.3)
+                time.sleep(0.5)
+
         raise last_err or TranslateError("未知翻译错误")
 
     def translate_async(self, text: str, target: str = "", source: str = "",
                         callback=None) -> None:
-        """异步翻译单条文本，完成后调用 callback(result)。"""
+        """异步翻译，完成后调用 callback(result)。"""
         def _worker():
             try:
                 result = self.translate(text, target=target, source=source)
                 if callback:
                     callback(result)
-            except TranslateError as e:
+            except Exception as e:
                 if callback:
                     callback(e)
         self._executor.submit(_worker)
 
     def translate_batch(self, texts: List[str], target: str = "") -> List[Optional[TranslationResult]]:
         """并发批量翻译，保持顺序。"""
-        tgt = target or self.cfg.target_lang
+        tgt = target or self.target_lang
         results: List[Optional[TranslationResult]] = [None] * len(texts)
         futures = {}
+
         for i, text in enumerate(texts):
-            if not needs_translation(text, tgt):
+            text = (text or "").strip()
+            if not text:
                 results[i] = None
                 continue
-            cache_key = f"{tgt}:{text}"
+
+            if tgt.startswith("zh") and self._is_chinese(text):
+                results[i] = None
+                continue
+
+            cache_key = f"{self.source_lang}:{tgt}:{text}"
             cached = self._cache_get(cache_key)
             if cached is not None:
-                results[i] = TranslationResult(text=cached, src="cache",
-                                               backend=self._backend.name, elapsed_ms=0)
+                results[i] = TranslationResult(text=cached, src_lang=self.source_lang,
+                                               backend="cache", elapsed_ms=0)
                 continue
-            fut = self._executor.submit(self._backend.translate, text, tgt)
+
+            fut = self._executor.submit(
+                self._backend.translate, text, tgt, self.source_lang)
             futures[fut] = i
+
         for fut in as_completed(futures):
             i = futures[fut]
             try:
                 result = fut.result()
-                cache_key = f"{tgt}:{texts[i]}"
-                self._cache_put(cache_key, result.text)
+                if result and result.text:
+                    cache_key = f"{self.source_lang}:{tgt}:{texts[i]}"
+                    self._cache_put(cache_key, result.text)
                 results[i] = result
-            except TranslateError as e:
+            except Exception as e:
                 log.warning("批量翻译第 %d 条失败: %s", i, e)
                 results[i] = None
+
         return results
+
+    @staticmethod
+    def _is_chinese(text: str) -> bool:
+        """粗略判断文本是否以中文为主。"""
+        if not text:
+            return False
+        cjk_count = 0
+        total = 0
+        for c in text:
+            if '\u4e00' <= c <= '\u9fff':
+                cjk_count += 1
+            if not c.isspace():
+                total += 1
+        if total == 0:
+            return False
+        return cjk_count / total > 0.3
 
     def shutdown(self):
         self._executor.shutdown(wait=False)

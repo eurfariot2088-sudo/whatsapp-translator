@@ -3,11 +3,12 @@ whatsapp_reader.py
 通过 Windows UI Automation（UIA）直接读取桌面 WhatsApp 窗口中的消息文本。
 绝不截屏、绝不依赖剪贴板，纯控件树遍历。
 
-优化点（v2）：
-- 轮询间隔降到 0.8 秒，支持实时翻译
-- 首次扫描只入缓存不翻译（避免刷屏），可通过配置开启
-- 新增「切换聊天检测」：当检测到聊天对象变化时自动清空缓存
-- 异步回调，不阻塞 UIA 遍历线程
+v3 改进：
+- 精准定位右侧聊天区域（排除左侧好友列表）
+- 按 Y 坐标排序，保持消息顺序
+- 切换聊天自动检测并清空
+- 滚动时重新检测全部可见消息
+- 首次扫描也翻译（配置控制）
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from config import ReaderConfig
 
@@ -28,8 +29,9 @@ log = logging.getLogger(__name__)
 class WhatsAppMessage:
     text: str
     direction: str            # "in" 收到的 / "out" 发出的
+    y_top: int = 0            # 顶部 Y 坐标，用于排序
     ts: float = field(default_factory=time.time)
-    sender: str = ""          # 发送者名称（如果可提取）
+    sender: str = ""
 
     def fingerprint(self) -> str:
         h = hashlib.sha1()
@@ -43,8 +45,7 @@ def _ensure_windows():
     import sys
     if sys.platform != "win32":
         raise RuntimeError(
-            "WhatsApp 消息自动读取依赖 Windows UI Automation，"
-            "只能在 Windows 上运行。"
+            "WhatsApp 消息自动读取依赖 Windows UI Automation，只能在 Windows 上运行。"
         )
 
 
@@ -52,26 +53,29 @@ class WhatsAppReader:
     """周期性读取 WhatsApp Desktop 消息的轮询器。"""
 
     def __init__(self, cfg: ReaderConfig,
-                 on_message: Callable[[WhatsAppMessage], None],
-                 on_chat_changed: Optional[Callable[[], None]] = None):
+                 on_messages: Callable[[List[WhatsAppMessage]], None],
+                 on_chat_changed: Optional[Callable[[str], None]] = None):
+        """
+        :param on_messages: 回调，参数为当前所有消息（按顺序）的列表
+        :param on_chat_changed: 回调，参数为当前聊天标题
+        """
         _ensure_windows()
         self.cfg = cfg
-        self.on_message = on_message
+        self.on_messages = on_messages
         self.on_chat_changed = on_chat_changed
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._seen: Set[str] = set()
-        self._seen_order: List[str] = []
-        self._window_lock = threading.Lock()
         self._last_chat_title: str = ""
-        self._primed = False
+        self._last_msg_count: int = 0
+        self._last_fp_set: Set[str] = set()
 
     # -------------------- 生命周期 --------------------
     def start(self):
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._primed = False
+        self._last_chat_title = ""
+        self._last_msg_count = 0
         self._thread = threading.Thread(target=self._loop, name="WA-Reader", daemon=True)
         self._thread.start()
         log.info("WhatsAppReader 已启动，轮询间隔 %.2fs", self.cfg.poll_interval)
@@ -82,16 +86,13 @@ class WhatsAppReader:
             self._thread.join(timeout=join_timeout)
         log.info("WhatsAppReader 已停止")
 
-    def clear_history(self):
-        with self._window_lock:
-            self._seen.clear()
-            self._seen_order.clear()
+    def refresh_now(self):
+        """立即触发一次扫描（不等待轮询）。"""
+        pass  # 轮询已经很快，不需要额外触发
 
     # -------------------- 主循环 --------------------
     def _loop(self):
         import uiautomation as auto
-        self._seen.clear()
-        self._seen_order.clear()
 
         while not self._stop.is_set():
             try:
@@ -106,79 +107,56 @@ class WhatsAppReader:
         if window is None:
             return
 
-        # 检测聊天是否切换
-        self._check_chat_changed(window)
-
-        messages = list(self._extract_messages(auto, window))
-
-        # 首次扫描：只入缓存，不回调
-        is_first = not self._primed
-        if is_first:
-            for msg in messages:
-                fp = msg.fingerprint()
-                with self._window_lock:
-                    self._seen.add(fp)
-                    self._seen_order.append(fp)
-            self._primed = True
-            if self.cfg.translate_history_on_start:
-                # 配置要求翻译历史消息
-                for msg in messages:
-                    self._dispatch(msg)
-            return
-
-        # 后续扫描：只处理新消息
-        for msg in messages:
-            fp = msg.fingerprint()
-            with self._window_lock:
-                if fp in self._seen:
-                    continue
-                if len(self._seen) >= self.cfg.max_history:
-                    drop = max(1, self.cfg.max_history // 4)
-                    for _ in range(drop):
-                        if self._seen_order:
-                            old = self._seen_order.pop(0)
-                            self._seen.discard(old)
-                self._seen.add(fp)
-                self._seen_order.append(fp)
-            self._dispatch(msg)
-
-    def _dispatch(self, msg: WhatsAppMessage):
-        if len(msg.text.strip()) < self.cfg.min_length:
-            return
-        if self.cfg.only_incoming and msg.direction != "in":
-            return
-        try:
-            self.on_message(msg)
-        except Exception:
-            log.exception("on_message 回调异常")
-
-    # -------------------- 聊天切换检测 --------------------
-    def _check_chat_changed(self, window):
-        if self.on_chat_changed is None:
-            return
-        try:
-            # 尝试获取当前聊天名称（通常在窗口顶部）
-            title = ""
-            for child in window.GetChildren():
+        # 获取聊天标题
+        chat_title = self._get_chat_title(window)
+        if chat_title and chat_title != self._last_chat_title:
+            self._last_chat_title = chat_title
+            log.info("检测到聊天切换: %s", chat_title)
+            if self.on_chat_changed:
                 try:
-                    name = child.Name or ""
-                    if name and len(name) > 1 and name != self.cfg.window_keyword:
-                        title = name
-                        break
-                except Exception:
-                    continue
-            if title and title != self._last_chat_title:
-                self._last_chat_title = title
-                with self._window_lock:
-                    self._seen.clear()
-                    self._seen_order.clear()
-                self._primed = False  # 重新预热
-                try:
-                    self.on_chat_changed()
+                    self.on_chat_changed(chat_title)
                 except Exception:
                     log.exception("on_chat_changed 回调异常")
+
+        # 提取消息
+        messages = list(self._extract_messages(window))
+        if not messages:
+            return
+
+        # 按 Y 坐标排序（从上到下）
+        messages.sort(key=lambda m: m.y_top)
+
+        # 过滤过短消息
+        messages = [m for m in messages if len(m.text.strip()) >= self.cfg.min_length]
+
+        if not messages:
+            return
+
+        # 去重（保留顺序）
+        seen = set()
+        unique_msgs = []
+        for m in messages:
+            fp = m.fingerprint()
+            if fp not in seen:
+                seen.add(fp)
+                unique_msgs.append(m)
+
+        if not unique_msgs:
+            return
+
+        # 判断是否有变化（数量变了 或 内容变了）
+        current_fps = {m.fingerprint() for m in unique_msgs}
+        if len(unique_msgs) == self._last_msg_count and current_fps == self._last_fp_set:
+            return  # 没有变化，跳过
+
+        self._last_msg_count = len(unique_msgs)
+        self._last_fp_set = current_fps
+
+        # 回调
+        try:
+            self.on_messages(unique_msgs)
         except Exception:
-            pass
+            log.exception("on_messages 回调异常")
 
     # -------------------- 窗口定位 --------------------
     def _find_window(self, auto):
@@ -188,7 +166,7 @@ class WhatsAppReader:
                 searchDepth=8,
                 ProcessName=self.cfg.process_name,
             )
-            if win and win.Exists(maxSearchSeconds=0.3):
+            if win and win.Exists(maxSearchSeconds=0.2):
                 return win
         except Exception:
             pass
@@ -198,109 +176,263 @@ class WhatsAppReader:
                 searchDepth=3,
                 Name=self.cfg.window_keyword,
             )
-            if win and win.Exists(maxSearchSeconds=0.3):
+            if win and win.Exists(maxSearchSeconds=0.2):
                 return win
         except Exception:
             pass
         return None
 
-    # -------------------- 提取消息 --------------------
-    def _extract_messages(self, auto, window) -> Iterable[WhatsAppMessage]:
+    # -------------------- 聊天标题 --------------------
+    def _get_chat_title(self, window) -> str:
+        """尝试获取当前聊天对象的名称。"""
+        try:
+            win_rect = window.BoundingRectangle
+            win_top = win_rect.top
+            win_bottom = win_rect.bottom
+            win_height = win_bottom - win_top
+            # 标题通常在顶部 15% 区域内
+            title_zone_bottom = win_top + int(win_height * 0.15)
+
+            # 找顶部区域的 TextControl
+            for ctrl, depth in self._walk_all(window, max_depth=6):
+                try:
+                    if (ctrl.ControlTypeName or "") != "TextControl":
+                        continue
+                    name = (ctrl.Name or "").strip()
+                    if not name or len(name) < 2:
+                        continue
+                    rect = ctrl.BoundingRectangle
+                    if rect.top < title_zone_bottom and rect.top > win_top:
+                        return name
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return ""
+
+    # -------------------- 提取消息（核心：只取右侧聊天区） --------------------
+    def _extract_messages(self, window) -> Iterable[WhatsAppMessage]:
         try:
             win_rect = window.BoundingRectangle
             win_left = win_rect.left
             win_right = win_rect.right
             win_width = win_right - win_left
+            win_top = win_rect.top
+            win_bottom = win_rect.bottom
+            win_height = win_bottom - win_top
+
+            # 聊天区域通常在右侧
+            # WhatsApp 布局：左侧约 30% 是好友列表，右侧 70% 是聊天区
+            # 我们从右侧 60% 开始算聊天区
+            chat_left = win_left + int(win_width * 0.35)
             mid_x = win_left + win_width // 2
-        except Exception:
-            mid_x = None
 
-        messages = list(self._strategy_list(auto, window, mid_x))
-        if not messages:
-            messages = list(self._strategy_text_fallback(auto, window, mid_x))
-        return messages
-
-    def _strategy_list(self, auto, window, mid_x) -> Iterable[WhatsAppMessage]:
-        try:
-            lists = window.GetChildren()
-            candidate_lists = []
-            for ctrl in lists:
-                try:
-                    ctype = ctrl.ControlTypeName or ""
-                    if "List" in ctype or "Pane" in ctype:
-                        sub_count = 0
-                        for _ in ctrl.GetChildren():
-                            sub_count += 1
-                        candidate_lists.append((sub_count, ctrl))
-                except Exception:
-                    continue
-            candidate_lists.sort(key=lambda x: x[0], reverse=True)
-            for _, ctrl in candidate_lists[:3]:
-                for msg in self._walk_list_items(ctrl, mid_x):
-                    yield msg
-        except Exception as e:
-            log.debug("_strategy_list 异常: %s", e)
-
-    def _walk_list_items(self, list_ctrl, mid_x) -> Iterable[WhatsAppMessage]:
-        try:
-            items = list_ctrl.GetChildren()
+            # 顶部 15% 是标题栏，底部 10% 是输入框
+            chat_top = win_top + int(win_height * 0.12)
+            chat_bottom = win_bottom - int(win_height * 0.10)
         except Exception:
             return
-        for item in items:
-            texts = self._collect_texts(item)
-            joined = self._join_texts(texts)
-            if not joined or len(joined.strip()) < 2:
-                continue
-            low = joined.lower()
-            if low in {"typing…", "typing...", "online", "last seen", "last seen recently"}:
-                continue
-            direction = self._guess_direction(item, mid_x)
-            yield WhatsAppMessage(text=joined, direction=direction)
 
-    def _strategy_text_fallback(self, auto, window, mid_x) -> Iterable[WhatsAppMessage]:
+        # 策略1：找聊天区里的 ListItem
+        found = list(self._strategy_list_items(window, chat_left, chat_top, chat_bottom, mid_x))
+        if found:
+            for m in found:
+                yield m
+            return
+
+        # 策略2：找聊天区里的所有 TextControl，按行分组
+        found = list(self._strategy_text_fallback(
+            window, chat_left, chat_top, chat_bottom, mid_x))
+        for m in found:
+            yield m
+
+    # -----------------------------------------------------------------------
+    # 策略1: ListItem
+    # -----------------------------------------------------------------------
+    def _strategy_list_items(self, window, chat_left, chat_top, chat_bottom, mid_x):
         try:
-            texts = []
-            for ctrl, depth in auto.WalkControl(window, includeTop=False):
+            # 找 List 控件
+            lists = []
+            for ctrl, depth in self._walk_all(window, max_depth=6):
+                try:
+                    ctype = ctrl.ControlTypeName or ""
+                    if "List" in ctype:
+                        rect = ctrl.BoundingRectangle
+                        # 聊天列表应该在右侧且高度较大
+                        if (rect.left >= chat_left - 20 and
+                                rect.top >= chat_top - 20 and
+                                rect.bottom <= chat_bottom + 20 and
+                                rect.height() > 100):
+                            lists.append(ctrl)
+                except Exception:
+                    continue
+
+            if not lists:
+                return
+
+            # 取最大的那个 List（消息列表）
+            lists.sort(key=lambda l: l.BoundingRectangle.height(), reverse=True)
+            msg_list = lists[0]
+
+            # 遍历子项
+            children = msg_list.GetChildren()
+            for child in children:
+                try:
+                    ctype = child.ControlTypeName or ""
+                    if "ListItem" not in ctype and "Pane" not in ctype:
+                        continue
+                    rect = child.BoundingRectangle
+                    if rect.left < chat_left - 20:
+                        continue
+                    if rect.top < chat_top - 20 or rect.bottom > chat_bottom + 20:
+                        continue
+
+                    texts = self._collect_texts(child)
+                    joined = self._clean_message("\n".join(texts))
+                    if not joined or len(joined) < 2:
+                        continue
+
+                    low = joined.lower().strip()
+                    skip_keywords = {"typing", "online", "last seen", "you",
+                                     "unread", "pinned", "archived"}
+                    if any(kw in low for kw in skip_keywords):
+                        continue
+
+                    direction = self._guess_direction(child, mid_x)
+                    yield WhatsAppMessage(
+                        text=joined,
+                        direction=direction,
+                        y_top=rect.top,
+                    )
+                except Exception:
+                    continue
+        except Exception as e:
+            log.debug("_strategy_list_items 异常: %s", e)
+
+    # -----------------------------------------------------------------------
+    # 策略2: TextControl 兜底
+    # -----------------------------------------------------------------------
+    def _strategy_text_fallback(self, window, chat_left, chat_top, chat_bottom, mid_x):
+        try:
+            texts = []  # (y, x, text)
+            for ctrl, depth in self._walk_all(window, max_depth=8):
                 try:
                     if (ctrl.ControlTypeName or "") != "TextControl":
                         continue
-                    name = ctrl.Name or ""
-                    if not name or len(name.strip()) < 2:
+                    name = (ctrl.Name or "").strip()
+                    if not name or len(name) < 2:
                         continue
                     rect = ctrl.BoundingRectangle
-                    texts.append((rect.top, rect.left, name))
+                    if rect.left < chat_left - 20:
+                        continue
+                    if rect.top < chat_top - 20 or rect.bottom > chat_bottom + 20:
+                        continue
+                    texts.append((rect.top, rect.left, name, rect.height()))
                 except Exception:
                     continue
+
             if not texts:
                 return
+
+            # 按 Y 排序
             texts.sort(key=lambda t: (t[0], t[1]))
 
+            # 按 Y 分组（同一行的归为一条消息）
             groups: List[List[tuple]] = []
             current: List[tuple] = []
             last_y = None
+            last_h = None
             for entry in texts:
-                y, x, name = entry
-                if last_y is None or abs(y - last_y) <= 8:
+                y, x, name, h = entry
+                if last_y is None:
                     current.append(entry)
+                    last_y = y
+                    last_h = h
                 else:
-                    groups.append(current)
-                    current = [entry]
-                last_y = y
+                    # Y 差在行高的 50% 以内认为是同一行
+                    if abs(y - last_y) <= max(h, last_h) * 0.5:
+                        current.append(entry)
+                    else:
+                        groups.append(current)
+                        current = [entry]
+                        last_y = y
+                        last_h = h
             if current:
                 groups.append(current)
 
+            # 合并同一消息的多行
+            # 不同的消息之间 Y 间距较大，我们用较大的 Y 阈值来合并
+            merged: List[List[List[tuple]]] = []
+            current_msg: List[List[tuple]] = []
+            last_bottom = None
             for grp in groups:
-                grp.sort(key=lambda t: t[1])
-                joined = "\n".join(g[2] for g in grp).strip()
-                if not joined or len(joined) < 2:
+                grp.sort(key=lambda t: t[1])  # 按 X 排序
+                grp_y = grp[0][0]
+                grp_h = grp[0][3] if grp else 16
+                grp_bottom = grp_y + grp_h
+
+                if last_bottom is None:
+                    current_msg.append(grp)
+                    last_bottom = grp_bottom
+                else:
+                    gap = grp_y - last_bottom
+                    if gap <= grp_h * 1.5:
+                        # 间距小，属于同一条消息的多行
+                        current_msg.append(grp)
+                    else:
+                        # 间距大，是新消息
+                        merged.append(current_msg)
+                        current_msg = [grp]
+                    last_bottom = max(last_bottom, grp_bottom)
+            if current_msg:
+                merged.append(current_msg)
+
+            # 生成消息
+            for msg_lines in merged:
+                text_parts = []
+                first_x = None
+                first_y = None
+                for line in msg_lines:
+                    line.sort(key=lambda t: t[1])
+                    line_text = " ".join(t[2] for t in line)
+                    text_parts.append(line_text)
+                    if first_x is None:
+                        first_x = line[0][1]
+                        first_y = line[0][0]
+
+                full_text = "\n".join(text_parts).strip()
+                cleaned = self._clean_message(full_text)
+                if not cleaned or len(cleaned) < 2:
                     continue
-                first_x = grp[0][1]
-                direction = "in" if mid_x is not None and first_x < mid_x else "out"
-                yield WhatsAppMessage(text=joined, direction=direction)
+
+                low = cleaned.lower().strip()
+                skip_keywords = {"typing", "online", "last seen", "unread",
+                                 "pinned", "archived", "muted"}
+                if any(kw in low for kw in skip_keywords):
+                    continue
+
+                direction = "in" if (first_x is not None and first_x < mid_x) else "out"
+                yield WhatsAppMessage(
+                    text=cleaned,
+                    direction=direction,
+                    y_top=first_y or 0,
+                )
         except Exception as e:
             log.debug("_strategy_text_fallback 异常: %s", e)
 
     # -------------------- 辅助 --------------------
+    @staticmethod
+    def _walk_all(root, max_depth: int = 5):
+        """广度优先遍历控件树。"""
+        import uiautomation as auto
+        try:
+            for ctrl, depth in auto.WalkControl(root, includeTop=False):
+                if depth > max_depth:
+                    continue
+                yield ctrl, depth
+        except Exception:
+            pass
+
     @staticmethod
     def _collect_texts(ctrl) -> List[str]:
         out: List[str] = []
@@ -312,6 +444,7 @@ class WhatsAppReader:
                         out.append(name)
         except Exception:
             pass
+        # 去重保持顺序
         seen = set()
         uniq = []
         for t in out:
@@ -321,11 +454,17 @@ class WhatsAppReader:
         return uniq
 
     @staticmethod
-    def _join_texts(texts: List[str]) -> str:
-        if not texts:
-            return ""
-        cleaned = [t for t in texts if t]
-        return "\n".join(cleaned).strip()
+    def _clean_message(text: str) -> str:
+        lines = []
+        for line in text.split("\n"):
+            s = line.strip()
+            if not s:
+                continue
+            # 去掉纯时间戳
+            if len(s) <= 8 and (":" in s) and all(c.isdigit() or c in ": " for c in s):
+                continue
+            lines.append(s)
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _guess_direction(item, mid_x) -> str:

@@ -1,31 +1,28 @@
 """
 screenshot.py
 截图翻译模块。
-- 全局热键 Ctrl+Alt+S 触发
-- 用 mss 快速截取全屏
-- tkinter 透明覆盖窗口让用户框选区域
-- pytesseract OCR 识别文字
-- 翻译识别结果并弹窗显示
 
-注意：需要安装 Tesseract-OCR 引擎。
-下载地址：https://github.com/UB-Mannheim/tesseract/wiki
+功能：
+- mss 快速截屏（全屏）
+- tkinter 全屏覆盖窗口，鼠标拖动选框
+- pytesseract OCR 识别文字
+- 翻译识别结果
+
+修复选框问题：
+- 不使用 alpha 透明，改用截图背景 + 蒙层
+- 确保鼠标事件能正确传递到 Canvas
 """
 
 from __future__ import annotations
 
-import io
 import logging
-import os
-import sys
 import threading
-import tkinter as tk
 from typing import Optional
 
-from PIL import Image, ImageTk
+from PIL import Image
 
 log = logging.getLogger(__name__)
 
-# Tesseract 路径自动检测
 _TESSERACT_PATHS = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -34,160 +31,208 @@ _TESSERACT_PATHS = [
 
 
 def _find_tesseract() -> Optional[str]:
-    """查找 tesseract.exe 路径。"""
-    # 先查环境变量
+    import os
     for p in os.environ.get("PATH", "").split(os.pathsep):
         exe = os.path.join(p, "tesseract.exe")
         if os.path.isfile(exe):
             return exe
-    # 再查常见路径
     for p in _TESSERACT_PATHS:
         if os.path.isfile(p):
             return p
     return None
 
 
-def ocr_image(image: Image.Image, lang: str = "eng+chi_sim") -> str:
-    """对 PIL Image 进行 OCR，返回识别文本。"""
+def ocr_image(image: Image.Image) -> str:
     import pytesseract  # type: ignore
     tesseract_path = _find_tesseract()
     if tesseract_path:
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
     try:
-        text = pytesseract.image_to_string(image, lang=lang)
+        # 多语言识别：英文+中文简体
+        text = pytesseract.image_to_string(image, lang="eng+chi_sim")
     except Exception as e:
-        raise RuntimeError(f"OCR 识别失败: {e}\n请确保已安装 Tesseract-OCR 引擎。")
+        raise RuntimeError(
+            f"OCR 识别失败: {e}\n\n"
+            "请确保已安装 Tesseract-OCR 引擎。\n"
+            "下载地址: https://github.com/UB-Mannheim/tesseract/wiki"
+        )
     return text.strip()
 
 
-def capture_screen() -> Image.Image:
-    """用 mss 截取全屏，返回 PIL Image。"""
+def capture_fullscreen() -> Image.Image:
     import mss  # type: ignore
     with mss.mss() as sct:
-        monitor = sct.monitors[1]  # 主显示器
+        monitor = sct.monitors[1]
         raw = sct.grab(monitor)
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
     return img
 
 
+# ============================================================================
+# 选区选择器
+# ============================================================================
 class RegionSelector:
-    """透明覆盖窗口，让用户用鼠标框选截图区域。"""
+    """全屏选区选择器。
+
+    实现方式：
+    1. 截取全屏
+    2. 创建全屏 tkinter 窗口
+    3. 用 Canvas 显示截图作为背景
+    4. 鼠标拖动时绘制选框（半透明黑色蒙层 + 红色边框）
+    """
 
     def __init__(self, callback):
         """
-        :param callback: 回调函数 callback(image: Image.Image)
+        :param callback: callback(image: Image.Image, x1, y1, x2, y2)
         """
         self.callback = callback
-        self.root = None
-        self.canvas = None
-        self.start_x = 0
-        self.start_y = 0
-        self.rect_id = None
         self._screen_img = None
+        self._start_x = 0
+        self._start_y = 0
+        self._end_x = 0
+        self._end_y = 0
+        self._rect_id = None
+        self._overlay_id = None
 
-    def show(self):
-        """在独立线程中运行（因为 tkinter 不是线程安全的）。"""
-        # 截取全屏
+    def run(self):
+        import tkinter as tk
+        from PIL import ImageTk
+
+        # 1. 截屏
         try:
-            self._screen_img = capture_screen()
+            self._screen_img = capture_fullscreen()
         except Exception as e:
             log.error("截图失败: %s", e)
             return
 
-        self.root = tk.Tk()
-        self.root.attributes("-fullscreen", True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.3)
-        self.root.configure(bg="black")
-        self.root.title("框选翻译区域")
+        # 2. 创建全屏窗口
+        root = tk.Tk()
+        root.attributes("-fullscreen", True)
+        root.attributes("-topmost", True)
+        root.configure(cursor="crosshair")
+        root.title("框选翻译区域 (ESC 取消)")
 
-        # 显示截图作为背景
-        self.tk_img = ImageTk.PhotoImage(self._screen_img)
-        self.canvas = tk.Canvas(self.root, highlightthickness=0, cursor="crosshair")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img)
+        screen_w = self._screen_img.width
+        screen_h = self._screen_img.height
 
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.root.bind("<Escape>", lambda e: self._cancel())
+        # 3. Canvas 显示截图背景
+        canvas = tk.Canvas(root, width=screen_w, height=screen_h,
+                           highlightthickness=0, bd=0, bg="black")
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        self._tk_img = ImageTk.PhotoImage(self._screen_img)
+        canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
 
         # 提示文字
-        self.canvas.create_text(
-            self.root.winfo_screenwidth() // 2,
-            30,
-            text="拖动鼠标框选要翻译的区域 | ESC 取消",
-            fill="red", font=("Microsoft YaHei", 16, "bold"),
+        canvas.create_text(
+            screen_w // 2, 40,
+            text="拖动鼠标选择要翻译的区域 | 按 ESC 取消",
+            fill="red", font=("Microsoft YaHei", 18, "bold"),
         )
 
-        self.root.mainloop()
+        # 4. 绑定鼠标事件
+        canvas.bind("<Button-1>", self._on_press)
+        canvas.bind("<B1-Motion>", self._on_drag)
+        canvas.bind("<ButtonRelease-1>", self._on_release)
+        root.bind("<Escape>", lambda e: self._cancel(root))
 
+        self._canvas = canvas
+        self._root = root
+        root.mainloop()
+
+    # ------------------------------------------------------------------
+    # 事件处理
+    # ------------------------------------------------------------------
     def _on_press(self, event):
-        self.start_x = event.x
-        self.start_y = event.y
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-        self.rect_id = self.canvas.create_rectangle(
-            self.start_x, self.start_y, event.x, event.y,
-            outline="red", width=2
+        self._start_x = event.x
+        self._start_y = event.y
+        self._end_x = event.x
+        self._end_y = event.y
+
+        # 删除旧选框
+        if self._rect_id:
+            self._canvas.delete(self._rect_id)
+
+        # 画新选框
+        self._rect_id = self._canvas.create_rectangle(
+            self._start_x, self._start_y, event.x, event.y,
+            outline="red", width=2,
         )
 
     def _on_drag(self, event):
-        if self.rect_id:
-            self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
+        self._end_x = event.x
+        self._end_y = event.y
+        if self._rect_id:
+            self._canvas.coords(
+                self._rect_id,
+                self._start_x, self._start_y,
+                event.x, event.y,
+            )
 
     def _on_release(self, event):
-        x1 = min(self.start_x, event.x)
-        y1 = min(self.start_y, event.y)
-        x2 = max(self.start_x, event.x)
-        y2 = max(self.start_y, event.y)
-        self.root.destroy()
+        x1 = min(self._start_x, self._end_x)
+        y1 = min(self._start_y, self._end_y)
+        x2 = max(self._start_x, self._end_x)
+        y2 = max(self._start_y, self._end_y)
 
+        # 区域太小，忽略
         if x2 - x1 < 5 or y2 - y1 < 5:
-            return  # 太小，忽略
+            self._cancel(self._root)
+            return
 
-        # 裁剪选区
+        # 裁剪
         cropped = self._screen_img.crop((x1, y1, x2, y2))
+
+        # 关闭窗口
+        self._root.destroy()
+
+        # 回调
         try:
-            self.callback(cropped)
+            self.callback(cropped, x1, y1, x2, y2)
         except Exception as e:
             log.exception("截图回调异常: %s", e)
 
-    def _cancel(self):
-        self.root.destroy()
+    def _cancel(self, root):
+        root.destroy()
 
 
+# ============================================================================
+# 对外接口
+# ============================================================================
 def start_screenshot_translate(translator, target_lang: str, on_result=None):
     """启动截图翻译流程。
+
     :param translator: Translator 实例
-    :param target_lang: 目标语言
+    :param target_lang: 目标语言代码
     :param on_result: 回调 on_result(original_text, translated_text)
     """
-    def _on_captured(img: Image.Image):
+    def _on_captured(img, x1, y1, x2, y2):
         # OCR
         try:
             text = ocr_image(img)
         except RuntimeError as e:
             if on_result:
-                on_result("", f"[OCR 错误] {e}")
+                on_result("", str(e))
             return
+
         if not text:
             if on_result:
                 on_result("", "[未识别到文字]")
             return
+
         # 翻译
         try:
             result = translator.translate(text, target=target_lang)
             translated = result.text if result else text
         except Exception as e:
             translated = f"[翻译失败] {e}"
+
         if on_result:
             on_result(text, translated)
 
-    # 在独立线程中运行 tkinter（避免和主线程冲突）
     def _run():
         selector = RegionSelector(callback=_on_captured)
-        selector.show()
+        selector.run()
 
     t = threading.Thread(target=_run, name="ScreenshotOCR", daemon=True)
     t.start()
