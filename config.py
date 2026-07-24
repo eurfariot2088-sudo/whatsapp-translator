@@ -1,6 +1,6 @@
 """
 config.py
-统一管理配置：翻译后端、目标语言、API Key、轮询频率等。
+统一管理配置：翻译后端、目标语言、API Key、轮询频率、气泡颜色、截图热键等。
 配置文件保存在用户目录 %APPDATA%/WhatsAppTranslator/config.yaml，首次运行自动生成。
 """
 
@@ -30,6 +30,30 @@ def get_app_dir() -> Path:
 
 CONFIG_FILE = get_app_dir() / "config.yaml"
 
+# 常用语言列表（用于下拉框）
+LANGUAGES = [
+    ("auto", "自动检测"),
+    ("zh-CN", "中文（简体）"),
+    ("zh-TW", "中文（繁体）"),
+    ("en", "英语"),
+    ("ja", "日语"),
+    ("ko", "韩语"),
+    ("fr", "法语"),
+    ("de", "德语"),
+    ("es", "西班牙语"),
+    ("ru", "俄语"),
+    ("pt", "葡萄牙语"),
+    ("it", "意大利语"),
+    ("th", "泰语"),
+    ("vi", "越南语"),
+    ("ar", "阿拉伯语"),
+    ("hi", "印地语"),
+    ("id", "印尼语"),
+    ("tr", "土耳其语"),
+    ("nl", "荷兰语"),
+    ("pl", "波兰语"),
+]
+
 
 @dataclass
 class TranslatorConfig:
@@ -37,49 +61,62 @@ class TranslatorConfig:
 
     # backend: "google" 或 "doubao"
     backend: str = "google"
-
-    # 目标语言（Google / 豆包通用 BCP-47 风格）
+    # 目标语言（自动消息翻译用）
     target_lang: str = "zh-CN"
     # 源语言，auto 表示自动检测
     source_lang: str = "auto"
-
     # 豆包（火山引擎 ARK）相关
     doubao_api_key: str = ""
-    doubao_model: str = "doubao-seed-1-6-250615"  # 也可改成 doubao-lite-32k 等
+    doubao_model: str = "doubao-seed-1-6-250615"
     doubao_endpoint: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
     doubao_timeout: int = 15
+    # Google 翻译超时（秒）
+    google_timeout: int = 10
 
 
 @dataclass
 class ReaderConfig:
     """WhatsApp 读取相关配置。"""
 
-    # 桌面 WhatsApp 进程名
     process_name: str = "WhatsApp.exe"
-    # 窗口标题包含的关键字（用于在多窗口中定位主窗口）
     window_keyword: str = "WhatsApp"
-    # 轮询频率（秒）
-    poll_interval: float = 1.5
+    # 轮询频率（秒）—— 降低到 0.8 秒以支持实时翻译
+    poll_interval: float = 0.8
     # 每次最多保留的历史消息数（去重用）
-    max_history: int = 500
-    # 是否只翻译「收到的」消息（True 会过滤掉自己发送的）
-    only_incoming: bool = True
-    # 消息最短长度，少于该长度的英文/数字噪声不翻译
-    min_length: int = 2
+    max_history: int = 800
+    # 是否只翻译收到的消息
+    only_incoming: bool = False
+    # 消息最短长度
+    min_length: int = 1
+    # 首次扫描时是否翻译已有历史消息（False=只翻译新消息，True=翻译全部）
+    translate_history_on_start: bool = False
 
 
 @dataclass
 class GuiConfig:
-    """GUI 行为配置。"""
+    """GUI 行为与外观配置。"""
 
-    # 启动时最小化到托盘
     start_minimized: bool = False
-    # 关闭窗口时最小化到托盘（而不是退出）
     close_to_tray: bool = True
-    # 全局热键：唤起主窗口
+    # 全局热键
     hotkey_show: str = "ctrl+alt+t"
-    # 主题：light / dark
+    hotkey_screenshot: str = "ctrl+alt+s"
+    # 主题
     theme: str = "light"
+    # 气泡颜色（HEX）
+    bubble_in_color: str = "#FFFFFF"       # 收到的消息气泡背景（白色）
+    bubble_in_text: str = "#333333"         # 收到的消息文字颜色
+    bubble_out_color: str = "#95EC69"       # 发出的消息气泡背景（微信绿）
+    bubble_out_text: str = "#333333"        # 发出的消息文字颜色
+    bubble_trans_color: str = "#F0F0F0"     # 译文区域背景
+    bubble_trans_text: str = "#666666"      # 译文文字颜色
+    # 聊天区域背景色
+    chat_bg_color: str = "#EDEDED"          # 微信式浅灰背景
+    # 底部回复区翻译的目标语言（独立于自动翻译目标语言）
+    reply_target_lang: str = "en"
+    # 字体
+    font_family: str = "Microsoft YaHei"
+    font_size: int = 11
 
 
 @dataclass
@@ -90,7 +127,6 @@ class AppConfig:
     reader: ReaderConfig = field(default_factory=ReaderConfig)
     gui: GuiConfig = field(default_factory=GuiConfig)
 
-    # ---- 序列化 ----
     def to_dict(self) -> Dict[str, Any]:
         return {
             "translator": asdict(self.translator),
@@ -109,7 +145,6 @@ class AppConfig:
             gui=GuiConfig(**{k: v for k, v in g.items() if k in GuiConfig.__annotations__}),
         )
 
-    # ---- 文件 IO ----
     def save(self, path: Path = CONFIG_FILE) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -126,11 +161,9 @@ class AppConfig:
                 data = yaml.safe_load(f) or {}
             return cls.from_dict(data)
         except Exception:
-            # 配置文件损坏时回退到默认
             return cls()
 
 
-# 便捷单例
 _settings: AppConfig | None = None
 
 
