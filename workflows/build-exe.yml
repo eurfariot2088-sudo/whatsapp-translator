@@ -41,6 +41,7 @@ jobs:
             --collect-all keyboard `
             --collect-all uiautomation `
             --collect-all comtypes `
+            --collect-all pywin32 `
             --collect-all requests `
             --collect-all yaml `
             --collect-all mss `
