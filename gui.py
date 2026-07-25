@@ -136,11 +136,11 @@ class TranslatorApp:
 
     # ==================== UI ====================
     def _build_ui(self):
-        self.root.title("WhatsApp 翻译助手 v5")
+        self.root.title("WhatsApp 翻译助手 v6")
         self.root.geometry("960x780")
         self.root.minsize(720, 600)
 
-        # ===== 顶部工具栏 =====
+        # ===== 顶部工具栏（固定） =====
         bar = ttk.Frame(self.root, padding=(8, 6))
         bar.pack(side=tk.TOP, fill=tk.X)
 
@@ -162,14 +162,25 @@ class TranslatorApp:
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
-        self.btn_toggle = ttk.Button(bar, text="▶ 开始监听", width=12, command=self._toggle)
+        self.btn_toggle = ttk.Button(bar, text="开始监听", width=10, command=self._toggle)
         self.btn_toggle.pack(side=tk.LEFT)
+        ttk.Button(bar, text="探测控件", width=10, command=self._probe).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(bar, text="清空", width=6, command=self._clear).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(bar, text="截图翻译", width=10, command=self._screenshot).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text="设置", width=6, command=self._open_settings).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(bar, text="退出", width=6, command=self._quit).pack(side=tk.RIGHT)
 
-        # ===== 聊天标题 =====
-        title_bar = tk.Frame(self.root, bg="#FFFFFF", height=30)
+        # ===== 主内容区：垂直 PanedWindow =====
+        # 上：聊天区域    中：翻译输入+译文    下：调试日志
+        main_pane = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # ---------- 第1格：聊天区域 ----------
+        chat_container = ttk.Frame(main_pane)
+        main_pane.add(chat_container, weight=5)
+
+        # 聊天标题栏
+        title_bar = tk.Frame(chat_container, bg="#FFFFFF", height=30)
         title_bar.pack(fill=tk.X)
         title_bar.pack_propagate(False)
         self.lbl_title = tk.Label(title_bar, text="未开始监听",
@@ -177,8 +188,8 @@ class TranslatorApp:
                                    bg="#FFFFFF", fg="#333333")
         self.lbl_title.pack(side=tk.LEFT, padx=12, pady=4)
 
-        # ===== 聊天区域 =====
-        chat_frame = tk.Frame(self.root, bg=self._colors["chat_bg"])
+        # 聊天内容
+        chat_frame = tk.Frame(chat_container, bg=self._colors["chat_bg"])
         chat_frame.pack(fill=tk.BOTH, expand=True)
 
         self.canvas = tk.Canvas(chat_frame, bg=self._colors["chat_bg"], highlightthickness=0)
@@ -193,12 +204,16 @@ class TranslatorApp:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
 
-        # ===== 底部回复翻译区 =====
-        rf = ttk.LabelFrame(self.root, text="翻译输入框（自动翻译）", padding=(8, 6))
-        rf.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(4, 0))
+        # ---------- 第2格：翻译输入区（再分成两个子格） ----------
+        reply_pane = ttk.PanedWindow(main_pane, orient=tk.VERTICAL)
+        main_pane.add(reply_pane, weight=2)
 
-        r1 = ttk.Frame(rf)
-        r1.pack(fill=tk.X, pady=(0, 4))
+        # 上：输入框
+        reply_top = ttk.LabelFrame(reply_pane, text="翻译输入框（自动翻译）", padding=(8, 4))
+        reply_pane.add(reply_top, weight=1)
+
+        r1 = ttk.Frame(reply_top)
+        r1.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(r1, text="目标语言:").pack(side=tk.LEFT)
         self.var_reply_lang = tk.StringVar(value="英语 (en)")
         reply_vals = [f"{n} ({c})" for c, n in get_language_list() if c != "auto"]
@@ -206,45 +221,41 @@ class TranslatorApp:
                      state="readonly", width=22).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(r1, text="复制译文", command=self._copy_reply).pack(side=tk.RIGHT)
 
-        self.reply_input = tk.Text(rf, height=2, font=(self._font_family, self._font_size), wrap=tk.WORD)
-        self.reply_input.pack(fill=tk.X, pady=(0, 4))
+        self.reply_input = tk.Text(reply_top, font=(self._font_family, self._font_size), wrap=tk.WORD)
+        self.reply_input.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
         self.reply_input.bind("<KeyRelease>", self._on_reply_input)
 
-        ttk.Label(rf, text="译文:").pack(anchor=tk.W)
-        self.reply_output = tk.Text(rf, height=2, font=(self._font_family, self._font_size),
+        # 下：译文框
+        reply_bottom = ttk.LabelFrame(reply_pane, text="译文", padding=(8, 4))
+        reply_pane.add(reply_bottom, weight=1)
+
+        self.reply_output = tk.Text(reply_bottom, font=(self._font_family, self._font_size),
                                     wrap=tk.WORD, bg="#F9F9F9")
-        self.reply_output.pack(fill=tk.X, pady=(2, 4))
+        self.reply_output.pack(fill=tk.BOTH, expand=True)
         self.reply_output.configure(state=tk.DISABLED)
 
-        # ===== 调试日志面板（可折叠） =====
-        self._debug_visible = True
-        debug_frame = ttk.LabelFrame(self.root, text="调试日志", padding=(4, 2))
-        debug_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 0))
+        # ---------- 第3格：调试日志 ----------
+        debug_container = ttk.LabelFrame(main_pane, text="调试日志", padding=(4, 2))
+        main_pane.add(debug_container, weight=2)
 
-        r2 = ttk.Frame(debug_frame)
-        r2.pack(fill=tk.X)
-        ttk.Button(r2, text="展开/收起", width=10, command=self._toggle_debug).pack(side=tk.LEFT)
-        ttk.Button(r2, text="清空日志", width=8, command=self._clear_debug).pack(side=tk.LEFT, padx=(4, 0))
+        r2 = ttk.Frame(debug_container)
+        r2.pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(r2, text="清空日志", width=8, command=self._clear_debug).pack(side=tk.LEFT)
         self.lbl_debug_status = ttk.Label(r2, text="等待启动...", foreground="blue")
         self.lbl_debug_status.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.debug_text = tk.Text(debug_frame, height=6, font=("Consolas", 9),
+        self.debug_text = tk.Text(debug_container, font=("Consolas", 9),
                                    bg="#1E1E1E", fg="#00FF00", insertbackground="#00FF00",
                                    wrap=tk.WORD, state=tk.DISABLED)
-        self.debug_text.pack(fill=tk.X, pady=(2, 0))
+        self.debug_text.pack(fill=tk.BOTH, expand=True)
 
-        # 状态栏
+        # ===== 状态栏（固定） =====
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.var_status, anchor=tk.W,
                   padding=(8, 3), relief=tk.SUNKEN).pack(side=tk.BOTTOM, fill=tk.X)
 
     def _toggle_debug(self):
-        if self._debug_visible:
-            self.debug_text.pack_forget()
-            self._debug_visible = False
-        else:
-            self.debug_text.pack(fill=tk.X, pady=(2, 0))
-            self._debug_visible = True
+        pass  # 兼容旧方法，现在用 PanedWindow 直接拖拽调整
 
     def _clear_debug(self):
         self._debug_lines.clear()
@@ -313,6 +324,33 @@ class TranslatorApp:
         self.running = False
         self.btn_toggle.configure(text="开始监听")
         self._set_status("已暂停")
+
+    def _probe(self):
+        """探测 WhatsApp 窗口的控件树。"""
+        if not self.reader:
+            # 还没创建 reader，先创建一个临时的
+            try:
+                from config import ReaderConfig
+                cfg = ReaderConfig(poll_interval=0.8, max_history=1000, min_length=1)
+                from whatsapp_reader import WhatsAppReader
+                reader = WhatsAppReader(cfg,
+                                        on_messages=lambda m: None,
+                                        on_debug=self._on_debug)
+            except RuntimeError as e:
+                messagebox.showerror("错误", str(e))
+                return
+        else:
+            reader = self.reader
+
+        self._append_debug("=== 开始探测控件树 ===")
+        self._set_status("正在探测控件...")
+
+        # 在子线程执行（探测可能较慢）
+        def worker():
+            reader.probe_controls()
+            self.root.after(0, lambda: self._set_status("探测完成"))
+
+        threading.Thread(target=worker, name="probe", daemon=True).start()
 
     def _clear(self):
         for w in self.scroll_frame.winfo_children():
@@ -453,6 +491,140 @@ class TranslatorApp:
             self._set_status("译文已复制")
         except Exception:
             pass
+
+    # ==================== 设置对话框 ====================
+    def _open_settings(self):
+        self._show_settings_dialog()
+
+    def _show_settings_dialog(self):
+        from config import get_settings, save_settings
+        settings = get_settings()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("设置")
+        dlg.geometry("520x420")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # --- 日志设置页 ---
+        log_frame = ttk.Frame(nb, padding=10)
+        nb.add(log_frame, text="日志")
+
+        ttk.Label(log_frame, text="日志文件路径:").pack(anchor=tk.W)
+        var_log_path = tk.StringVar(value=settings.gui.log_file_path or "")
+        path_frame = ttk.Frame(log_frame)
+        path_frame.pack(fill=tk.X, pady=(2, 4))
+        ent_log = ttk.Entry(path_frame, textvariable=var_log_path)
+        ent_log.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def browse_log():
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                parent=dlg,
+                defaultextension=".log",
+                filetypes=[("日志文件", "*.log"), ("所有文件", "*.*")],
+                initialfile="app.log",
+            )
+            if path:
+                var_log_path.set(path)
+
+        ttk.Button(path_frame, text="浏览...", width=8, command=browse_log).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(log_frame, text="留空则使用默认路径: %APPDATA%\\WhatsAppTranslator\\logs\\app.log",
+                  font=("", 8), foreground="gray").pack(anchor=tk.W, pady=(0, 8))
+
+        ttk.Label(log_frame, text="日志级别:").pack(anchor=tk.W)
+        var_log_level = tk.StringVar(value=settings.gui.log_level or "DEBUG")
+        ttk.Combobox(log_frame, textvariable=var_log_level,
+                     values=["DEBUG", "INFO", "WARNING", "ERROR"],
+                     state="readonly", width=12).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Separator(log_frame).pack(fill=tk.X, pady=8)
+
+        btn_frame = ttk.Frame(log_frame)
+        btn_frame.pack(fill=tk.X)
+
+        def open_log_folder():
+            import os
+            if var_log_path.get():
+                folder = os.path.dirname(var_log_path.get())
+            else:
+                from config import get_app_dir
+                folder = str(get_app_dir() / "logs")
+            try:
+                os.startfile(folder)
+            except Exception as e:
+                messagebox.showerror("错误", f"无法打开文件夹:\n{e}", parent=dlg)
+
+        def open_log_file():
+            import os
+            if var_log_path.get():
+                fpath = var_log_path.get()
+            else:
+                from config import get_app_dir
+                fpath = str(get_app_dir() / "logs" / "app.log")
+            try:
+                os.startfile(fpath)
+            except Exception as e:
+                messagebox.showerror("错误", f"无法打开日志文件:\n{e}\n\n路径: {fpath}", parent=dlg)
+
+        ttk.Button(btn_frame, text="打开日志文件夹", command=open_log_folder).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="查看日志文件", command=open_log_file).pack(side=tk.LEFT, padx=(4, 0))
+
+        # --- 读取设置页 ---
+        read_frame = ttk.Frame(nb, padding=10)
+        nb.add(read_frame, text="消息读取")
+
+        ttk.Label(read_frame, text="轮询间隔（秒）:").pack(anchor=tk.W)
+        var_poll = tk.StringVar(value=str(settings.reader.poll_interval))
+        ttk.Entry(read_frame, textvariable=var_poll, width=10).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(read_frame, text="窗口标题关键词:").pack(anchor=tk.W)
+        var_win_kw = tk.StringVar(value=settings.reader.window_keyword)
+        ttk.Entry(read_frame, textvariable=var_win_kw, width=20).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(read_frame, text="进程名:").pack(anchor=tk.W)
+        var_proc = tk.StringVar(value=settings.reader.process_name)
+        ttk.Entry(read_frame, textvariable=var_proc, width=20).pack(anchor=tk.W, pady=(2, 8))
+
+        # --- 翻译设置页 ---
+        tr_frame = ttk.Frame(nb, padding=10)
+        nb.add(tr_frame, text="翻译")
+
+        ttk.Label(tr_frame, text="翻译后端:").pack(anchor=tk.W)
+        var_backend = tk.StringVar(value=settings.translator.backend)
+        ttk.Combobox(tr_frame, textvariable=var_backend,
+                     values=["google", "doubao"],
+                     state="readonly", width=12).pack(anchor=tk.W, pady=(2, 8))
+
+        ttk.Label(tr_frame, text="豆包 API Key:").pack(anchor=tk.W)
+        var_api = tk.StringVar(value=settings.translator.doubao_api_key)
+        ttk.Entry(tr_frame, textvariable=var_api, show="*", width=40).pack(anchor=tk.W, pady=(2, 8))
+
+        # --- 底部按钮 ---
+        bottom = ttk.Frame(dlg, padding=(10, 0, 10, 10))
+        bottom.pack(fill=tk.X)
+
+        def save_and_close():
+            try:
+                settings.gui.log_file_path = var_log_path.get().strip()
+                settings.gui.log_level = var_log_level.get()
+                settings.reader.poll_interval = float(var_poll.get())
+                settings.reader.window_keyword = var_win_kw.get().strip()
+                settings.reader.process_name = var_proc.get().strip()
+                settings.translator.backend = var_backend.get()
+                settings.translator.doubao_api_key = var_api.get().strip()
+                save_settings()
+                messagebox.showinfo("保存成功", "设置已保存。\n\n注意：部分设置需要重启程序才能生效。", parent=dlg)
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e), parent=dlg)
+
+        ttk.Button(bottom, text="保存", command=save_and_close, width=10).pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="取消", command=dlg.destroy, width=10).pack(side=tk.RIGHT, padx=(0, 8))
 
     # ==================== 截图翻译 ====================
     def _screenshot(self):

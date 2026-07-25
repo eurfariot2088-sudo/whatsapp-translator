@@ -2,11 +2,10 @@
 whatsapp_reader.py
 通过 Windows UI Automation 读取桌面 WhatsApp 消息。
 
-v5 核心修复：
-- process_name 不带 .exe（uiautomation 要求）
-- 加 on_debug 回调，实时输出调试信息到 UI
-- 增强窗口查找：遍历所有顶层窗口，列出所有匹配的窗口名
-- 简化消息提取逻辑
+v6 — 探测模式：
+- 加入控件树探测功能，列出 WhatsApp 窗口所有控件
+- 消息提取不限制控件类型，只要有 Name/Value 就尝试
+- 支持 LegacyIAccessible、TextPattern、ValuePattern 多种文本获取方式
 """
 
 from __future__ import annotations
@@ -56,11 +55,11 @@ class WhatsAppReader:
         self.on_debug = on_debug
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._last_chat_title = ""
         self._last_fps: Set[str] = set()
         self._last_count = 0
         self._scan_count = 0
         self._window_found = False
+        self._window_ref = None
 
     def _debug(self, msg: str):
         log.info(msg)
@@ -83,6 +82,64 @@ class WhatsAppReader:
         if self._thread:
             self._thread.join(timeout=join_timeout)
         self._debug("Reader 已停止")
+
+    def probe_controls(self):
+        """探测 WhatsApp 窗口的控件树，输出到调试日志。"""
+        import uiautomation as auto
+        window = self._find_window(auto)
+        if window is None:
+            self._debug("[探测] 未找到 WhatsApp 窗口")
+            return
+
+        self._debug("[探测] === 开始探测控件树 ===")
+        self._debug("[探测] 窗口标题: '%s' Class: '%s'" % (window.Name, window.ClassName))
+        try:
+            rect = window.BoundingRectangle
+            self._debug("[探测] 窗口大小: %dx%d 位置: (%d,%d)" %
+                        (rect.width(), rect.height(), rect.left, rect.top))
+        except Exception:
+            pass
+
+        # 遍历所有子控件，输出有名称的
+        self._probe_children(window, depth=0, max_depth=6)
+        self._debug("[探测] === 探测结束 ===")
+
+    def _probe_children(self, ctrl, depth, max_depth):
+        if depth > max_depth:
+            return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:
+            return
+
+        for child in children:
+            try:
+                name = child.Name or ""
+                ctype = child.ControlTypeName or ""
+                cname = child.ClassName or ""
+
+                # 只输出有意义的控件
+                has_name = len(name) >= 1
+                is_container = ctype in ["PaneControlType", "GroupControlType", "ListControlType",
+                                          "ListItemControlType", "DataItemControlType",
+                                          "TabControlType", "TreeControlType", "WindowControlType"]
+
+                if has_name or is_container:
+                    try:
+                        rect = child.BoundingRectangle
+                        pos_str = "(%d,%d,%d,%d)" % (rect.left, rect.top, rect.right, rect.bottom)
+                    except Exception:
+                        pos_str = "?"
+
+                    prefix = "  " * depth
+                    name_display = name[:50] if name else "(无名称)"
+                    self._debug("[探测] %s%s | %s | %s | %s" %
+                                (prefix, ctype, cname, name_display, pos_str))
+            except Exception:
+                continue
+
+            # 递归
+            self._probe_children(child, depth + 1, max_depth)
 
     # -------------------- 主循环 --------------------
     def _loop(self):
@@ -107,12 +164,13 @@ class WhatsAppReader:
 
         if not self._window_found:
             self._window_found = True
-            self._debug("已找到 WhatsApp 窗口！")
+            self._window_ref = window
+            self._debug("已找到 WhatsApp 窗口！标题: '%s'" % window.Name)
 
         messages = self._extract_messages(auto, window)
 
         if not messages:
-            if self._scan_count <= 5 or self._scan_count % 30 == 0:
+            if self._scan_count <= 10 or self._scan_count % 30 == 0:
                 self._debug("扫描 #%d: 窗口已找到，但未提取到消息" % self._scan_count)
             return
 
@@ -142,39 +200,17 @@ class WhatsAppReader:
 
     # -------------------- 窗口定位 --------------------
     def _find_window(self, auto):
-        """查找 WhatsApp 窗口 — 遍历所有顶层窗口。"""
         try:
             root = auto.GetRootControl()
             for child in root.GetChildren():
                 try:
                     name = child.Name or ""
-                    cname = child.ClassName or ""
-                    # 匹配 WhatsApp 窗口
                     if self.cfg.window_keyword.lower() in name.lower():
-                        if self._scan_count <= 2:
-                            self._debug("找到窗口: '%s' class='%s'" % (name, cname))
                         return child
                 except Exception:
                     continue
-        except Exception as e:
-            self._debug("遍历窗口失败: %s" % e)
-
-        # 如果第一次没找到，列出所有窗口名（帮助诊断）
-        if self._scan_count == 1:
-            try:
-                root = auto.GetRootControl()
-                names = []
-                for child in root.GetChildren():
-                    try:
-                        n = child.Name or ""
-                        if n and len(n) > 1:
-                            names.append(n)
-                    except Exception:
-                        continue
-                self._debug("所有顶层窗口: %s" % ", ".join(names[:30]))
-            except Exception:
-                pass
-
+        except Exception:
+            pass
         return None
 
     # -------------------- 提取消息 --------------------
@@ -190,224 +226,185 @@ class WhatsAppReader:
             win_width = win_right - win_left
             win_height = win_bottom - win_top
             mid_x = win_left + win_width // 2
-
-            # 聊天区域：右侧
             chat_left = win_left + int(win_width * 0.30)
             chat_top = win_top + int(win_height * 0.10)
             chat_bottom = win_bottom - int(win_height * 0.08)
-
-            if self._scan_count <= 2:
-                self._debug("窗口 %dx%d, 聊天区 left=%d top=%d bot=%d mid=%d" %
-                            (win_width, win_height, chat_left, chat_top, chat_bottom, mid_x))
         except Exception as e:
             self._debug("获取窗口位置失败: %s" % e)
             return []
 
-        # 策略1: 找 List 控件中的 ListItem
-        messages = self._find_list_items(window, chat_left, chat_top, chat_bottom, mid_x)
-        if messages:
-            if self._scan_count <= 3:
-                self._debug("策略1(ListItem) 找到 %d 条" % len(messages))
-            return messages
+        # 策略1: 找所有带文字的控件（不限类型）
+        texts = []
+        self._collect_all_texts(window, chat_left, chat_top, chat_bottom, texts,
+                                depth=0, max_depth=12)
 
-        # 策略2: 递归找所有 TextControl
-        messages = self._find_text_controls(window, chat_left, chat_top, chat_bottom, mid_x)
-        if messages:
-            if self._scan_count <= 3:
-                self._debug("策略2(TextControl) 找到 %d 条" % len(messages))
-            return messages
+        if not texts:
+            # 策略2: 全窗口搜索
+            self._collect_all_texts(window, win_left, win_top, win_bottom, texts,
+                                    depth=0, max_depth=12, unrestricted=True)
 
-        # 策略3: 不限制区域，找所有 TextControl
+        if not texts:
+            return []
+
         if self._scan_count <= 5:
-            self._debug("策略1和2都失败，尝试策略3（全窗口）")
-        messages = self._find_text_controls(window, win_left, win_top, win_bottom, mid_x,
-                                             unrestricted=True)
-        if messages and self._scan_count <= 5:
-            self._debug("策略3(全窗口) 找到 %d 条" % len(messages))
-        return messages
+            self._debug("找到 %d 个带文本的控件" % len(texts))
 
-    # -----------------------------------------------------------------------
-    # 策略1: ListItem
-    # -----------------------------------------------------------------------
-    def _find_list_items(self, window, chat_left, chat_top, chat_bottom, mid_x):
-        messages = []
-        try:
-            for child in window.GetChildren():
-                try:
-                    ctype = child.ControlTypeName or ""
-                    if "List" not in ctype:
-                        continue
-                    rect = child.BoundingRectangle
-                    if rect.left < chat_left - 50:
-                        continue
-                    if rect.height() < 80:
-                        continue
+        # 按 Y 排序
+        texts.sort(key=lambda t: (t[0], t[1]))
 
-                    for item in child.GetChildren():
-                        try:
-                            irect = item.BoundingRectangle
-                            if irect.left < chat_left - 50:
-                                continue
-                            if irect.top < chat_top - 50 or irect.bottom > chat_bottom + 50:
-                                continue
+        # 分组：按 Y 距离
+        groups = []
+        current = []
+        last_y = None
+        for entry in texts:
+            y, x, text, h = entry
+            if last_y is None or abs(y - last_y) <= max(h, 16) * 0.6:
+                current.append(entry)
+            else:
+                if current:
+                    groups.append(current)
+                current = [entry]
+            last_y = y
+        if current:
+            groups.append(current)
 
-                            text = self._get_item_text(item)
-                            text = self._clean(text)
-                            if not text or len(text) < 2:
-                                continue
+        # 合并相邻行
+        merged = []
+        cur_msg = []
+        last_bottom = None
+        for grp in groups:
+            grp.sort(key=lambda t: t[1])
+            gy = grp[0][0]
+            gh = grp[0][3] if grp else 16
+            gbot = gy + gh
 
-                            direction = self._guess_dir(item, mid_x)
-                            messages.append(WhatsAppMessage(
-                                text=text, direction=direction, y_top=irect.top))
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-        except Exception as e:
-            self._debug("_find_list_items 异常: %s" % e)
-
-        return messages
-
-    # -----------------------------------------------------------------------
-    # 策略2/3: TextControl 递归
-    # -----------------------------------------------------------------------
-    def _find_text_controls(self, window, chat_left, chat_top, chat_bottom, mid_x,
-                             unrestricted=False):
-        messages = []
-        try:
-            texts = []
-            self._collect_text_recursive(window, chat_left, chat_top, chat_bottom,
-                                         texts, depth=0, max_depth=10,
-                                         unrestricted=unrestricted)
-
-            if not texts:
-                return []
-
-            # 按 Y 排序
-            texts.sort(key=lambda t: (t[0], t[1]))
-
-            # 分组合并
-            groups = []
-            current = []
-            last_y = None
-            for entry in texts:
-                y, x, text, h = entry
-                if last_y is None or abs(y - last_y) <= max(h, 16) * 0.5:
-                    current.append(entry)
-                else:
-                    if current:
-                        groups.append(current)
-                    current = [entry]
-                last_y = y
-            if current:
-                groups.append(current)
-
-            # 合并相邻行
-            merged = []
-            cur_msg = []
-            last_bottom = None
-            for grp in groups:
-                grp.sort(key=lambda t: t[1])
-                gy = grp[0][0]
-                gh = grp[0][3] if grp else 16
-                gbot = gy + gh
-
-                if last_bottom is None:
+            if last_bottom is None:
+                cur_msg.append(grp)
+            else:
+                gap = gy - last_bottom
+                if gap <= gh * 1.8:
                     cur_msg.append(grp)
                 else:
-                    gap = gy - last_bottom
-                    if gap <= gh * 1.5:
-                        cur_msg.append(grp)
-                    else:
-                        merged.append(cur_msg)
-                        cur_msg = [grp]
-                last_bottom = max(last_bottom or 0, gbot)
-            if cur_msg:
-                merged.append(cur_msg)
+                    merged.append(cur_msg)
+                    cur_msg = [grp]
+            last_bottom = max(last_bottom or 0, gbot)
+        if cur_msg:
+            merged.append(cur_msg)
 
-            for msg_lines in merged:
-                parts = []
-                fx = None
-                fy = None
-                for line in msg_lines:
-                    line.sort(key=lambda t: t[1])
-                    parts.append(" ".join(t[2] for t in line))
-                    if fx is None:
-                        fx = line[0][1]
-                        fy = line[0][0]
+        # 生成消息
+        for msg_lines in merged:
+            parts = []
+            fx = None
+            fy = None
+            for line in msg_lines:
+                line.sort(key=lambda t: t[1])
+                parts.append(" ".join(t[2] for t in line))
+                if fx is None:
+                    fx = line[0][1]
+                    fy = line[0][0]
 
-                full = "\n".join(parts).strip()
-                cleaned = self._clean(full)
-                if not cleaned or len(cleaned) < 2:
-                    continue
+            full = "\n".join(parts).strip()
+            cleaned = self._clean(full)
+            if not cleaned or len(cleaned) < 2:
+                continue
 
-                low = cleaned.lower()
-                if any(kw in low for kw in ["typing", "online", "last seen", "search"]):
-                    continue
+            low = cleaned.lower()
+            skip = ["typing", "online", "last seen", "search", "unread",
+                    "archived", "pinned", "muted", "whatsapp"]
+            if any(kw in low for kw in skip):
+                continue
 
-                direction = "in" if (fx is not None and fx < mid_x) else "out"
-                messages.append(WhatsAppMessage(text=cleaned, direction=direction, y_top=fy or 0))
-        except Exception as e:
-            self._debug("_find_text_controls 异常: %s" % e)
+            # 过滤掉纯数字和特殊字符
+            if all(c.isdigit() or c in ":.,!? " for c in cleaned) and len(cleaned) < 10:
+                continue
+
+            direction = "in" if (fx is not None and fx < mid_x) else "out"
+            messages.append(WhatsAppMessage(text=cleaned, direction=direction, y_top=fy or 0))
 
         return messages
 
-    def _collect_text_recursive(self, ctrl, chat_left, chat_top, chat_bottom,
-                                 texts, depth=0, max_depth=10, unrestricted=False):
+    def _collect_all_texts(self, ctrl, chat_left, chat_top, chat_bottom,
+                            texts, depth=0, max_depth=12, unrestricted=False):
+        """递归收集所有有文本的控件（不限 TextControl）。"""
         if depth > max_depth:
             return
         try:
             children = ctrl.GetChildren()
-            for child in children:
-                try:
-                    ctype = child.ControlTypeName or ""
-                    rect = child.BoundingRectangle
-
-                    in_zone = unrestricted or (
-                        rect.left >= chat_left - 50 and
-                        rect.top >= chat_top - 50 and
-                        rect.bottom <= chat_bottom + 50
-                    )
-
-                    if in_zone:
-                        if ctype == "TextControl":
-                            name = (child.Name or "").strip()
-                            if name and len(name) >= 2:
-                                texts.append((rect.top, rect.left, name, rect.height()))
-
-                    # 不管是否在区域内，都递归子控件
-                    # （因为父控件可能不在区域内，但子控件在）
-                    if not in_zone and not unrestricted:
-                        # 如果控件完全不在区域内，也尝试递归（有些容器很大）
-                        self._collect_text_recursive(child, chat_left, chat_top, chat_bottom,
-                                                     texts, depth + 1, max_depth, unrestricted)
-                    else:
-                        self._collect_text_recursive(child, chat_left, chat_top, chat_bottom,
-                                                     texts, depth + 1, max_depth, unrestricted)
-                except Exception:
-                    continue
         except Exception:
-            pass
+            return
 
-    # -------------------- 辅助 --------------------
+        for child in children:
+            try:
+                ctype = child.ControlTypeName or ""
+                rect = child.BoundingRectangle
+
+                in_zone = unrestricted or (
+                    rect.left >= chat_left - 30 and
+                    rect.top >= chat_top - 30 and
+                    rect.bottom <= chat_bottom + 30
+                )
+
+                if in_zone:
+                    # 尝试多种方式获取文本
+                    text = self._get_control_text(child)
+                    if text and len(text) >= 1 and len(text) <= 500:
+                        h = rect.height() if rect.height() > 0 else 16
+                        texts.append((rect.top, rect.left, text, h))
+
+                # 递归子控件（不限制区域，因为父控件可能很大但子控件在区域内）
+                self._collect_all_texts(child, chat_left, chat_top, chat_bottom,
+                                        texts, depth + 1, max_depth, unrestricted)
+            except Exception:
+                continue
+
     @staticmethod
-    def _get_item_text(item) -> str:
-        texts = []
+    def _get_control_text(ctrl) -> str:
+        """尝试多种方式获取控件文本。"""
         try:
-            for sub, _ in item.WalkControl(item, includeTop=False):
-                if (sub.ControlTypeName or "") == "TextControl":
-                    name = (sub.Name or "").strip()
-                    if name:
-                        texts.append(name)
+            name = (ctrl.Name or "").strip()
+            if name:
+                return name
         except Exception:
             pass
-        seen = set()
-        uniq = []
-        for t in texts:
-            if t not in seen:
-                seen.add(t)
-                uniq.append(t)
-        return "\n".join(uniq)
+
+        # 尝试 ValuePattern
+        try:
+            if hasattr(ctrl, 'GetValuePattern'):
+                val = ctrl.GetValuePattern().Value
+                val = (val or "").strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+
+        # 尝试 TextPattern
+        try:
+            if hasattr(ctrl, 'GetTextPattern'):
+                tp = ctrl.GetTextPattern()
+                if tp:
+                    val = tp.DocumentRange.GetText(-1)
+                    val = (val or "").strip()
+                    if val:
+                        return val
+        except Exception:
+            pass
+
+        # 尝试 LegacyIAccessible
+        try:
+            if hasattr(ctrl, 'GetLegacyIAccessiblePattern'):
+                lap = ctrl.GetLegacyIAccessiblePattern()
+                if lap and lap.Value:
+                    val = (lap.Value or "").strip()
+                    if val:
+                        return val
+                if lap and lap.Name:
+                    val = (lap.Name or "").strip()
+                    if val:
+                        return val
+        except Exception:
+            pass
+
+        return ""
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -420,12 +417,3 @@ class WhatsAppReader:
                 continue
             lines.append(s)
         return "\n".join(lines).strip()
-
-    @staticmethod
-    def _guess_dir(item, mid_x) -> str:
-        try:
-            rect = item.BoundingRectangle
-            cx = (rect.left + rect.right) // 2
-            return "in" if cx < mid_x else "out"
-        except Exception:
-            return "in"

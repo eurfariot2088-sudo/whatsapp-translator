@@ -117,6 +117,10 @@ class GuiConfig:
     # 字体
     font_family: str = "Microsoft YaHei"
     font_size: int = 11
+    # 日志文件路径（留空=默认 %APPDATA%/WhatsAppTranslator/logs/app.log）
+    log_file_path: str = ""
+    # 日志级别: DEBUG / INFO / WARNING / ERROR
+    log_level: str = "DEBUG"
 
 
 @dataclass

@@ -18,21 +18,41 @@ from pathlib import Path
 
 def _setup_logging():
     try:
-        from config import get_app_dir
-        log_dir = get_app_dir() / "logs"
+        from config import get_app_dir, get_settings
+        settings = get_settings()
+
+        # 日志文件路径
+        if settings.gui.log_file_path:
+            log_path = Path(settings.gui.log_file_path)
+            log_dir = log_path.parent
+        else:
+            log_dir = get_app_dir() / "logs"
+            log_path = log_dir / "app.log"
         log_dir.mkdir(parents=True, exist_ok=True)
+
         fmt = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        fh = RotatingFileHandler(log_dir / "app.log", maxBytes=1_000_000,
-                                  backupCount=3, encoding="utf-8")
+
+        # 文件日志
+        fh = RotatingFileHandler(log_path, maxBytes=2_000_000,
+                                backupCount=5, encoding="utf-8")
         fh.setFormatter(fmt)
+
+        # 级别
+        level_str = (settings.gui.log_level or "DEBUG").upper()
+        level = getattr(logging, level_str, logging.DEBUG)
+
         root = logging.getLogger()
-        root.setLevel(logging.INFO)
+        root.setLevel(level)
         root.addHandler(fh)
-    except Exception:
-        pass
+
+        log = logging.getLogger(__name__)
+        log.info("日志初始化完成，日志文件: %s", log_path)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
 
 
 def _check_platform():

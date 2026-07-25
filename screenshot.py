@@ -2,15 +2,14 @@
 screenshot.py
 截图翻译模块。
 
-v4 修复：
-- 截图选框窗口在调用方的 tkinter 主线程中运行（不跨线程）
-- OCR 和翻译在子线程中执行，不阻塞 UI
-- 结果弹窗显示截图 + 原文 + 译文
+v5：
+- 不关闭/隐藏主窗口
+- 截图选框后打开独立新窗口显示截图内容
+- 在新窗口中直接进行 OCR + 翻译，实时更新结果
 """
 
 from __future__ import annotations
 
-import io
 import logging
 import threading
 from typing import Optional
@@ -65,31 +64,26 @@ def capture_fullscreen() -> Image.Image:
 
 
 # ============================================================================
-# 选区选择器（必须在主线程调用）
+# 选区选择器（必须在主线程调用，不隐藏主窗口）
 # ============================================================================
 def show_region_selector(parent_tk, callback):
     """
-    在主线程中显示全屏选区窗口。
+    显示全屏选区窗口。不隐藏主窗口。
 
-    :param parent_tk: 父 tkinter 窗口（会暂时隐藏）
+    :param parent_tk: 父 tkinter 窗口（保持可见）
     :param callback: 选区完成后调用 callback(cropped_image: Image.Image)
     """
     import tkinter as tk
     from PIL import ImageTk
 
-    # 1. 截屏（在隐藏父窗口后）
-    parent_tk.withdraw()
-    parent_tk.update()
-
-    # 短暂等待确保窗口已隐藏
+    # 1. 截屏（不隐藏主窗口，全屏选区窗口会覆盖在最上层）
     import time
-    time.sleep(0.15)
+    time.sleep(0.1)
 
     try:
         screen_img = capture_fullscreen()
     except Exception as e:
         log.error("截图失败: %s", e)
-        parent_tk.deiconify()
         return
 
     # 2. 创建全屏选区窗口
@@ -102,19 +96,12 @@ def show_region_selector(parent_tk, callback):
     screen_w = screen_img.width
     screen_h = screen_img.height
 
-    # 创建浅色蒙层版本（在原截图上叠加半透明白色）
-    from PIL import ImageEnhance
-    overlay_img = Image.new("RGBA", (screen_w, screen_h), (255, 255, 255, 60))
-    dimmed = Image.alpha_composite(screen_img.convert("RGBA"), overlay_img)
-    # 转回 RGB 用于 PhotoImage
-    dimmed = dimmed.convert("RGB")
-
     canvas = tk.Canvas(overlay, width=screen_w, height=screen_h,
-                       highlightthickness=0, bd=0, bg="#888888")
+                       highlightthickness=0, bd=0, bg="#000000")
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    # 显示带浅色蒙层的截图
-    tk_img = ImageTk.PhotoImage(dimmed)
+    # 直接显示原始截图，清晰可见
+    tk_img = ImageTk.PhotoImage(screen_img)
     canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
 
     # 保存原始截图用于选区内显示
@@ -137,13 +124,11 @@ def show_region_selector(parent_tk, callback):
             canvas.delete(state["rect_id"])
         if state["orig_id"]:
             canvas.delete(state["orig_id"])
-        # 选框内的原图（亮色显示）
         state["orig_id"] = canvas.create_image(event.x, event.y, anchor=tk.NW, image=tk_orig)
         state["rect_id"] = canvas.create_rectangle(
             event.x, event.y, event.x, event.y,
-            outline="#FF0000", width=3,
+            outline="#FF0000", width=2,
         )
-        # 把选框提到最上层
         canvas.tag_raise(state["rect_id"])
 
     def on_drag(event):
@@ -154,12 +139,11 @@ def show_region_selector(parent_tk, callback):
         if state["rect_id"]:
             canvas.coords(state["rect_id"], x1, y1, x2, y2)
         if state["orig_id"]:
-            # 裁剪选区内的原图并显示
             crop = screen_img.crop((x1, y1, x2, y2))
             crop_tk = ImageTk.PhotoImage(crop)
             canvas.delete(state["orig_id"])
             state["orig_id"] = canvas.create_image(x1, y1, anchor=tk.NW, image=crop_tk)
-            state["crop_tk"] = crop_tk  # 防止 GC
+            state["crop_tk"] = crop_tk
             canvas.tag_raise(state["rect_id"])
 
     def on_release(event):
@@ -171,17 +155,9 @@ def show_region_selector(parent_tk, callback):
         overlay.destroy()
 
         if x2 - x1 < 5 or y2 - y1 < 5:
-            # 太小，取消
-            parent_tk.deiconify()
             return
 
-        # 裁剪
         cropped = screen_img.crop((x1, y1, x2, y2))
-
-        # 恢复父窗口
-        parent_tk.deiconify()
-
-        # 回调
         try:
             callback(cropped)
         except Exception as e:
@@ -189,66 +165,71 @@ def show_region_selector(parent_tk, callback):
 
     def on_escape(event):
         overlay.destroy()
-        parent_tk.deiconify()
 
     canvas.bind("<Button-1>", on_press)
     canvas.bind("<B1-Motion>", on_drag)
     canvas.bind("<ButtonRelease-1>", on_release)
     overlay.bind("<Escape>", on_escape)
 
-    # 确保窗口获得焦点
     overlay.focus_force()
 
 
 # ============================================================================
-# 截图翻译结果弹窗
+# 截图翻译结果窗口（独立窗口，实时更新）
 # ============================================================================
-class ScreenshotResultDialog:
-    """显示截图翻译结果的弹窗（含图片）。"""
+class ScreenshotResultWindow:
+    """独立的截图翻译结果窗口。先显示截图，然后实时更新 OCR 和翻译结果。"""
 
     @staticmethod
-    def show(parent_tk, image: Image.Image, original: str, translated: str):
-        """在主线程中创建结果弹窗。"""
+    def show(parent_tk, image: Image.Image):
+        """创建结果窗口，先显示图片和"识别中..."状态。"""
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk
         from PIL import ImageTk
 
         dlg = tk.Toplevel(parent_tk)
-        dlg.title("截图翻译结果")
-        dlg.geometry("600x550")
+        dlg.title("截图翻译")
+        dlg.geometry("620x600")
+        dlg.transient(parent_tk)
 
         f = ttk.Frame(dlg, padding=10)
         f.pack(fill=tk.BOTH, expand=True)
 
-        # 截图预览
-        ttk.Label(f, text="截图预览：", font=("", 10, "bold")).pack(anchor=tk.W)
-        # 缩放图片适应显示
-        max_w = 560
-        max_h = 180
+        # ---- 截图显示区 ----
+        ttk.Label(f, text="截图内容：", font=("", 10, "bold")).pack(anchor=tk.W)
+        img_frame = ttk.Frame(f, relief=tk.SUNKEN, borderwidth=1)
+        img_frame.pack(fill=tk.X, pady=(2, 8))
+
+        max_w = 580
+        max_h = 200
         img_copy = image.copy()
         img_copy.thumbnail((max_w, max_h), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(img_copy)
-        lbl_img = tk.Label(f, image=tk_img)
-        lbl_img.pack(pady=(4, 8))
-        lbl_img.image = tk_img  # 防止 GC
+        lbl_img = tk.Label(img_frame, image=tk_img, bg="#F0F0F0")
+        lbl_img.pack(padx=4, pady=4)
+        lbl_img.image = tk_img
 
-        # 原文
+        # ---- 原文区 ----
         ttk.Label(f, text="识别原文：", font=("", 10, "bold")).pack(anchor=tk.W)
         txt_orig = tk.Text(f, height=4, wrap=tk.WORD, font=("Microsoft YaHei", 10))
         txt_orig.pack(fill=tk.X, pady=(2, 6))
-        txt_orig.insert("1.0", original)
+        txt_orig.insert("1.0", "正在识别文字...")
         txt_orig.configure(state=tk.DISABLED)
 
-        # 译文
+        # ---- 译文区 ----
         ttk.Label(f, text="译文：", font=("", 10, "bold")).pack(anchor=tk.W)
-        txt_trans = tk.Text(f, height=4, wrap=tk.WORD, font=("Microsoft YaHei", 11))
-        txt_trans.pack(fill=tk.X, pady=(2, 6))
-        txt_trans.insert("1.0", translated)
+        txt_trans = tk.Text(f, height=6, wrap=tk.WORD, font=("Microsoft YaHei", 11))
+        txt_trans.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
+        txt_trans.insert("1.0", "等待翻译...")
         txt_trans.configure(state=tk.DISABLED)
 
-        # 按钮
+        # ---- 状态标签 ----
+        lbl_status = ttk.Label(f, text="正在处理...", foreground="blue")
+        lbl_status.pack(anchor=tk.W)
+
+        # ---- 按钮区 ----
         btn_frame = ttk.Frame(f)
-        btn_frame.pack(fill=tk.X)
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
 
         def copy_to_clip(text):
             try:
@@ -257,14 +238,58 @@ class ScreenshotResultDialog:
             except Exception:
                 pass
 
-        ttk.Button(btn_frame, text="复制译文",
-                   command=lambda: copy_to_clip(translated)).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn_frame, text="复制原文",
-                   command=lambda: copy_to_clip(original)).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="关闭",
-                   command=dlg.destroy).pack(side=tk.LEFT)
+        btn_copy_trans = ttk.Button(btn_frame, text="复制译文", state=tk.DISABLED)
+        btn_copy_trans.pack(side=tk.RIGHT, padx=4)
+        btn_copy_orig = ttk.Button(btn_frame, text="复制原文", state=tk.DISABLED)
+        btn_copy_orig.pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.LEFT)
 
         dlg.focus_force()
+
+        # 返回控制器，供外部更新内容
+        return _ResultController(dlg, txt_orig, txt_trans, lbl_status,
+                                  btn_copy_orig, btn_copy_trans, copy_to_clip)
+
+
+class _ResultController:
+    """用于更新结果窗口内容的控制器。"""
+
+    def __init__(self, dlg, txt_orig, txt_trans, lbl_status,
+                 btn_orig, btn_trans, copy_fn):
+        self.dlg = dlg
+        self.txt_orig = txt_orig
+        self.txt_trans = txt_trans
+        self.lbl_status = lbl_status
+        self.btn_orig = btn_orig
+        self.btn_trans = btn_trans
+        self._copy_fn = copy_fn
+        self._orig_text = ""
+        self._trans_text = ""
+
+    def set_original(self, text: str):
+        self._orig_text = text
+        self.txt_orig.configure(state=tk.NORMAL)
+        self.txt_orig.delete("1.0", "end")
+        self.txt_orig.insert("1.0", text)
+        self.txt_orig.configure(state=tk.DISABLED)
+        self.btn_orig.configure(state=tk.NORMAL, command=lambda: self._copy_fn(text))
+        self.lbl_status.configure(text="原文识别完成，正在翻译...", foreground="blue")
+
+    def set_translated(self, text: str):
+        self._trans_text = text
+        self.txt_trans.configure(state=tk.NORMAL)
+        self.txt_trans.delete("1.0", "end")
+        self.txt_trans.insert("1.0", text)
+        self.txt_trans.configure(state=tk.DISABLED)
+        self.btn_trans.configure(state=tk.NORMAL, command=lambda: self._copy_fn(text))
+        self.lbl_status.configure(text="翻译完成", foreground="green")
+
+    def set_error(self, msg: str):
+        self.lbl_status.configure(text=f"错误: {msg}", foreground="red")
+        self.txt_trans.configure(state=tk.NORMAL)
+        self.txt_trans.delete("1.0", "end")
+        self.txt_trans.insert("1.0", f"[错误] {msg}")
+        self.txt_trans.configure(state=tk.DISABLED)
 
 
 # ============================================================================
@@ -275,26 +300,31 @@ def start_screenshot_translate(parent_tk, translator, target_lang: str):
     启动截图翻译（在主线程调用）。
 
     流程：
-    1. 显示全屏选区窗口（主线程）
-    2. 用户选区后，在子线程中 OCR + 翻译
-    3. 完成后在主线程中显示结果弹窗
+    1. 显示全屏选区窗口（主窗口保持可见）
+    2. 用户选区后，打开独立结果窗口显示截图
+    3. 子线程中 OCR + 翻译，实时更新结果窗口
     """
     def on_captured(img: Image.Image):
-        # 在子线程中执行 OCR + 翻译
+        # 先创建结果窗口（主线程），显示截图
+        ctrl = ScreenshotResultWindow.show(parent_tk, img)
+
+        # 子线程中执行 OCR + 翻译
         def worker():
             # OCR
             try:
                 text = ocr_image(img)
             except RuntimeError as e:
-                parent_tk.after(0, lambda: _show_error(parent_tk, str(e)))
+                parent_tk.after(0, lambda: ctrl.set_error(str(e)))
                 return
 
             if not text:
                 text = "[未识别到文字]"
-                translated = ""
-                parent_tk.after(0, lambda: ScreenshotResultDialog.show(
-                    parent_tk, img, text, translated))
+                parent_tk.after(0, lambda: ctrl.set_original(text))
+                parent_tk.after(0, lambda: ctrl.set_translated("（无内容可翻译）"))
                 return
+
+            # 更新原文
+            parent_tk.after(0, lambda: ctrl.set_original(text))
 
             # 翻译
             try:
@@ -303,20 +333,10 @@ def start_screenshot_translate(parent_tk, translator, target_lang: str):
             except Exception as e:
                 translated = f"[翻译失败] {e}"
 
-            # 在主线程显示结果
-            parent_tk.after(0, lambda: ScreenshotResultDialog.show(
-                parent_tk, img, text, translated))
+            parent_tk.after(0, lambda: ctrl.set_translated(translated))
 
         t = threading.Thread(target=worker, name="OCR-Translate", daemon=True)
         t.start()
 
     # 在主线程显示选区窗口
     show_region_selector(parent_tk, on_captured)
-
-
-def _show_error(parent_tk, msg: str):
-    """显示错误弹窗。"""
-    import tkinter as tk
-    from tkinter import messagebox
-    messagebox.showerror("截图翻译", msg, parent=parent_tk)
-    parent_tk.deiconify()
