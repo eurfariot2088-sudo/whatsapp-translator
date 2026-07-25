@@ -1,12 +1,12 @@
 """
 whatsapp_reader.py
-通过 Windows UI Automation 读取桌面 WhatsApp 消息。
+通过 Win32 API + OCR 读取桌面 WhatsApp 消息。
 
-v8 — 增强版：
-- 多策略窗口查找（标题关键词 / 进程名 / 类名 / Win32 API）
-- UI Automation 多模式文本提取 + WebView2 特殊处理
-- OCR 自动兜底：使用 Windows 内置 OCR（无需安装 Tesseract）
-- 更详细的调试日志，方便排查
+v9 — OCR 为主方式：
+- 使用 win32gui 精确查找 WhatsApp 窗口（底层 API，绕过 UI Automation 限制）
+- 直接截取聊天区域图片，用 Windows 内置 OCR 识别文字
+- 根据文字位置判断消息方向（左=收到，右=发送）
+- 实时更新，支持切换对话框和滚动
 """
 
 from __future__ import annotations
@@ -59,10 +59,8 @@ class WhatsAppReader:
         self._last_fps: Set[str] = set()
         self._last_count = 0
         self._scan_count = 0
+        self._window_hwnd = 0
         self._window_found = False
-        self._window_ref = None
-        self._ocr_mode = False
-        self._ocr_available = None  # None=未检测, True/False
 
     def _debug(self, msg: str):
         log.info(msg)
@@ -71,22 +69,6 @@ class WhatsAppReader:
                 self.on_debug(msg)
             except Exception:
                 pass
-
-    def _check_ocr(self) -> bool:
-        if self._ocr_available is not None:
-            return self._ocr_available
-        try:
-            from ocr_engine import is_available
-            self._ocr_available = is_available()
-            if self._ocr_available:
-                from ocr_engine import get_backend_name
-                self._debug("OCR 引擎可用: %s" % get_backend_name())
-            else:
-                self._debug("OCR 引擎不可用，仅使用 UI Automation")
-        except Exception as e:
-            self._debug("OCR 检测失败: %s" % e)
-            self._ocr_available = False
-        return self._ocr_available
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -103,146 +85,109 @@ class WhatsAppReader:
         self._debug("Reader 已停止")
 
     def probe_controls(self):
-        """探测 WhatsApp 窗口的控件树，输出到调试日志。"""
-        import uiautomation as auto
-        window = self._find_window(auto)
-        if window is None:
+        """探测 WhatsApp 窗口信息，输出到调试日志。"""
+        self._debug("[探测] === 开始探测 WhatsApp 窗口 ===")
+        hwnd = self._find_whatsapp_window()
+        if hwnd == 0:
             self._debug("[探测] 未找到 WhatsApp 窗口")
-            return
+        else:
+            import win32gui
+            import win32con
+            title = win32gui.GetWindowText(hwnd)
+            rect = win32gui.GetWindowRect(hwnd)
+            self._debug("[探测] 窗口句柄: 0x%08X" % hwnd)
+            self._debug("[探测] 窗口标题: '%s'" % title)
+            self._debug("[探测] 窗口位置: (%d,%d) 大小: %dx%d" %
+                        (rect[0], rect[1], rect[2]-rect[0], rect[3]-rect[1]))
 
-        self._debug("[探测] === 开始探测控件树 ===")
-        self._debug("[探测] 窗口标题: '%s' Class: '%s'" % (window.Name, window.ClassName))
-        try:
-            rect = window.BoundingRectangle
-            self._debug("[探测] 窗口大小: %dx%d 位置: (%d,%d)" %
-                        (rect.width(), rect.height(), rect.left, rect.top))
-        except Exception:
-            pass
-
-        # 遍历所有子控件，输出有名称的
-        self._probe_children(window, depth=0, max_depth=6)
-
-        # 额外：尝试找 WebView2 / Chrome / Electron 相关控件
-        self._debug("[探测] === 查找 WebView/Electron 容器 ===")
-        self._find_webview_containers(window, depth=0)
+            # 查找子窗口（找 WebView/Chrome 容器）
+            self._debug("[探测] === 查找子窗口 ===")
+            self._enum_child_windows(hwnd, depth=0, max_depth=4)
 
         self._debug("[探测] === 探测结束 ===")
 
-    def _probe_children(self, ctrl, depth, max_depth):
+    def _enum_child_windows(self, hwnd, depth, max_depth):
         if depth > max_depth:
             return
-        try:
-            children = ctrl.GetChildren()
-        except Exception:
-            return
+        import win32gui
+        import win32con
 
-        for child in children:
+        def callback(child_hwnd, lparam):
+            if not win32gui.IsWindowVisible(child_hwnd):
+                return True
             try:
-                name = child.Name or ""
-                ctype = child.ControlTypeName or ""
-                cname = child.ClassName or ""
-
-                has_name = len(name) >= 1
-                is_container = ctype in ["PaneControlType", "GroupControlType", "ListControlType",
-                                          "ListItemControlType", "DataItemControlType",
-                                          "TabControlType", "TreeControlType", "WindowControlType",
-                                          "DocumentControlType", "EditControlType", "TextControlType",
-                                          "CustomControlType", "ToolBarControlType"]
-
-                if has_name or is_container:
-                    try:
-                        rect = child.BoundingRectangle
-                        pos_str = "(%d,%d,%d,%d)" % (rect.left, rect.top, rect.right, rect.bottom)
-                    except Exception:
-                        pos_str = "?"
-
-                    prefix = "  " * depth
-                    name_display = name[:60] if name else "(无名称)"
-                    self._debug("[探测] %s%s | %s | %s | %s" %
-                                (prefix, ctype, cname, name_display, pos_str))
+                class_name = win32gui.GetClassName(child_hwnd)
+                title = win32gui.GetWindowText(child_hwnd)
+                rect = win32gui.GetWindowRect(child_hwnd)
+                prefix = "  " * depth
+                title_display = title[:40] if title else "(无标题)"
+                self._debug("[探测] %s类名: %s | 标题: %s | 位置: (%d,%d,%d,%d)" %
+                            (prefix, class_name, title_display, rect[0], rect[1], rect[2], rect[3]))
+                self._enum_child_windows(child_hwnd, depth + 1, max_depth)
             except Exception:
-                continue
+                pass
+            return True
 
-            self._probe_children(child, depth + 1, max_depth)
-
-    def _find_webview_containers(self, ctrl, depth):
-        if depth > 10:
-            return
-        try:
-            cname = (ctrl.ClassName or "").lower()
-            ctype = (ctrl.ControlTypeName or "").lower()
-            name = (ctrl.Name or "").lower()
-
-            keywords = ["webview", "chrome", "electron", "cef", "edge", "widgetwin", "intermediate"]
-            if any(kw in cname for kw in keywords) or any(kw in name for kw in keywords):
-                try:
-                    rect = ctrl.BoundingRectangle
-                    pos_str = "(%d,%d,%d,%d)" % (rect.left, rect.top, rect.right, rect.bottom)
-                except Exception:
-                    pos_str = "?"
-                self._debug("[探测] 找到浏览器容器: %s | %s | %s" % (ctype, ctrl.ClassName, pos_str))
-
-            for child in ctrl.GetChildren():
-                self._find_webview_containers(child, depth + 1)
-        except Exception:
-            pass
+        win32gui.EnumChildWindows(hwnd, callback, 0)
 
     # -------------------- 主循环 --------------------
     def _loop(self):
-        import uiautomation as auto
-        consec_fail = 0
         while not self._stop.is_set():
             try:
-                found = self._scan_once(auto)
-                if not found:
-                    consec_fail += 1
-                    # 连续 5 次没提取到消息，尝试 OCR 兜底
-                    if consec_fail >= 5 and not self._ocr_mode:
-                        if self._check_ocr():
-                            self._ocr_mode = True
-                            self._debug("UI Automation 连续未提取到消息，切换到 OCR 模式")
-                        else:
-                            if consec_fail == 5:
-                                self._debug("UI Automation 无法提取消息，且 OCR 不可用。请确保 WhatsApp 窗口可见。")
-                else:
-                    consec_fail = 0
+                self._scan_once()
             except Exception as e:
                 self._debug("扫描异常: %s" % e)
                 log.exception("扫描异常")
             self._stop.wait(self.cfg.poll_interval)
 
     # -------------------- 单次扫描 --------------------
-    def _scan_once(self, auto) -> bool:
+    def _scan_once(self):
         self._scan_count += 1
 
-        window = self._find_window(auto)
-        if window is None:
+        # 1. 查找 WhatsApp 窗口
+        hwnd = self._find_whatsapp_window()
+        if hwnd == 0:
             if self._scan_count <= 3 or self._scan_count % 20 == 0:
-                self._debug("未找到 WhatsApp 窗口 (扫描 #%d)，请确保 WhatsApp 已打开" % self._scan_count)
-            return False
+                self._debug("未找到 WhatsApp 窗口 (扫描 #%d)" % self._scan_count)
+            return
 
-        if not self._window_found:
+        # 窗口句柄变化 = 切换了窗口
+        if hwnd != self._window_hwnd:
+            self._window_hwnd = hwnd
             self._window_found = True
-            self._window_ref = window
-            self._debug("已找到 WhatsApp 窗口！标题: '%s' Class: '%s'" % (window.Name, window.ClassName))
+            import win32gui
+            title = win32gui.GetWindowText(hwnd)
+            self._debug("已找到 WhatsApp 窗口！标题: '%s' 句柄: 0x%08X" % (title, hwnd))
+            if self.on_chat_changed:
+                try:
+                    self.on_chat_changed(title)
+                except Exception:
+                    pass
 
-        # 先尝试 UI Automation
-        messages = self._extract_messages_uia(auto, window)
+        # 2. 获取窗口区域
+        rect = self._get_window_rect(hwnd)
+        if not rect:
+            return
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
 
-        # UI Automation 没拿到，且 OCR 模式已开启，用 OCR
-        if not messages and self._ocr_mode:
-            messages = self._extract_messages_ocr(window)
-            if messages and self._scan_count % 10 == 0:
-                self._debug("OCR 模式提取到 %d 条消息" % len(messages))
+        if width < 300 or height < 300:
+            if self._scan_count % 20 == 0:
+                self._debug("窗口太小，可能被最小化")
+            return
+
+        # 3. 截取聊天区域并 OCR 识别
+        messages = self._ocr_chat_area(left, top, right, bottom)
 
         if not messages:
-            if self._scan_count <= 10 or self._scan_count % 30 == 0:
-                mode = "UI Automation" if not self._ocr_mode else "OCR"
-                self._debug("扫描 #%d: 窗口已找到，但未提取到消息（模式: %s）" % (self._scan_count, mode))
-            return True
+            if self._scan_count <= 5 or self._scan_count % 30 == 0:
+                self._debug("扫描 #%d: 未识别到消息" % self._scan_count)
+            return
 
         messages.sort(key=lambda m: m.y_top)
 
+        # 4. 去重
         seen = set()
         unique = []
         for m in messages:
@@ -253,454 +198,129 @@ class WhatsAppReader:
 
         current_fps = {m.fingerprint() for m in unique}
         if len(unique) == self._last_count and current_fps == self._last_fps:
-            return True
+            return
 
         old_count = self._last_count
         self._last_count = len(unique)
         self._last_fps = current_fps
-        mode = "UI Automation" if not self._ocr_mode else "OCR"
-        self._debug("扫描 #%d: %d 条消息 (上次 %d, 模式: %s)" % (self._scan_count, len(unique), old_count, mode))
+        self._debug("扫描 #%d: %d 条消息 (上次 %d)" % (self._scan_count, len(unique), old_count))
 
+        # 5. 回调
         try:
             self.on_messages(unique)
         except Exception:
             log.exception("on_messages 回调异常")
 
-        return True
+    # -------------------- 查找 WhatsApp 窗口（多策略） --------------------
+    def _find_whatsapp_window(self) -> int:
+        import win32gui
+        import win32con
+        import psutil
 
-    # -------------------- 窗口定位（多策略） --------------------
-    def _find_window(self, auto):
-        # 策略1: 按标题关键词（最常见）
-        try:
-            root = auto.GetRootControl()
-            for child in root.GetChildren():
-                try:
-                    name = (child.Name or "").lower()
-                    if self.cfg.window_keyword.lower() in name:
-                        return child
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # 策略2: 按进程名（Win32 API）
-        try:
-            import ctypes
-            import ctypes.wintypes
-            EnumWindows = ctypes.windll.user32.EnumWindows
-            EnumWindowsProc = ctypes.WINFUNCTYPE(
-                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
-            )
-            GetWindowTextW = ctypes.windll.user32.GetWindowTextW
-            GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
-            IsWindowVisible = ctypes.windll.user32.IsWindowVisible
-            GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
-
-            found_hwnd = []
-
-            def foreach(hwnd, lParam):
-                if not IsWindowVisible(hwnd):
-                    return True
-                length = GetWindowTextLengthW(hwnd)
-                if length == 0:
-                    return True
-                buf = ctypes.create_unicode_buffer(length + 1)
-                GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-
-                # 检查进程名
-                pid = ctypes.wintypes.DWORD()
-                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                try:
-                    from psutil import Process
-                    proc = Process(pid.value)
-                    pname = proc.name().lower()
-                    if self.cfg.process_name.lower() in pname:
-                        found_hwnd.append(hwnd)
-                        return False
-                except Exception:
-                    pass
-
-                # 同时检查标题
-                if self.cfg.window_keyword.lower() in title.lower():
-                    found_hwnd.append(hwnd)
-                    return False
+        # 策略1: 按标题关键词查找（最常见）
+        def callback1(hwnd, lparam):
+            if not win32gui.IsWindowVisible(hwnd):
                 return True
+            if not win32gui.IsWindowEnabled(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd).lower()
+            if self.cfg.window_keyword.lower() in title:
+                lparam[0] = hwnd
+                return False
+            return True
 
-            EnumWindows(EnumWindowsProc(foreach), 0)
-            if found_hwnd:
-                hwnd = found_hwnd[0]
-                try:
-                    return auto.ControlFromHandle(hwnd)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        result = [0]
+        win32gui.EnumWindows(callback1, result)
+        if result[0] != 0:
+            return result[0]
 
-        # 策略3: 用 uiautomation 的窗口搜索（正则匹配）
+        # 策略2: 按进程名查找
+        def callback2(hwnd, lparam):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if not win32gui.GetWindowText(hwnd):
+                return True
+            tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
+            try:
+                proc = psutil.Process(pid)
+                if self.cfg.process_name.lower() in proc.name().lower():
+                    lparam[0] = hwnd
+                    return False
+            except Exception:
+                pass
+            return True
+
+        result = [0]
+        win32gui.EnumWindows(callback2, result)
+        if result[0] != 0:
+            return result[0]
+
+        # 策略3: 按类名查找（Electron/Chrome 类名）
+        class_names = ["Chrome_WidgetWin_1", "Qt51514QWindowIcon"]
+        for cls in class_names:
+            hwnd = win32gui.FindWindow(cls, None)
+            if hwnd != 0:
+                title = win32gui.GetWindowText(hwnd)
+                if self.cfg.window_keyword.lower() in title.lower():
+                    return hwnd
+
+        return 0
+
+    # -------------------- 获取窗口区域 --------------------
+    def _get_window_rect(self, hwnd) -> Optional[tuple]:
+        import win32gui
         try:
-            win = auto.WindowControl(searchDepth=1, Name=auto.RegexMatcher(
-                r".*" + self.cfg.window_keyword + r".*"))
-            if win.Exists(0.5):
-                return win
-        except Exception:
-            pass
-
-        # 策略4: 按类名查找（Chrome_WidgetWin_1 等 Electron 常见类名）
-        try:
-            import ctypes
-            import ctypes.wintypes
-            FindWindow = ctypes.windll.user32.FindWindowW
-            class_names = ["Chrome_WidgetWin_1", "MozillaWindowClass", "IEFrame", "Qt51514QWindowIcon"]
-            for cls in class_names:
-                hwnd = FindWindow(cls, None)
-                if hwnd:
-                    # 检查标题是否包含关键词
-                    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-                        if self.cfg.window_keyword.lower() in buf.value.lower():
-                            try:
-                                return auto.ControlFromHandle(hwnd)
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-
+            rect = win32gui.GetWindowRect(hwnd)
+            left, top, right, bottom = rect
+            if right > left and bottom > top:
+                return (left, top, right, bottom)
+        except Exception as e:
+            self._debug("获取窗口区域失败: %s" % e)
         return None
 
-    # -------------------- 提取消息（UI Automation 方式） --------------------
-    def _extract_messages_uia(self, auto, window) -> List[WhatsAppMessage]:
-        messages: List[WhatsAppMessage] = []
-
+    # -------------------- OCR 识别聊天区域 --------------------
+    def _ocr_chat_area(self, left, top, right, bottom) -> List[WhatsAppMessage]:
+        """截取聊天区域并 OCR 识别。"""
         try:
-            win_rect = window.BoundingRectangle
-            win_left = win_rect.left
-            win_right = win_rect.right
-            win_top = win_rect.top
-            win_bottom = win_rect.bottom
-            win_width = win_right - win_left
-            win_height = win_bottom - win_top
-            mid_x = win_left + win_width // 2
-            chat_left = win_left + int(win_width * 0.30)
-            chat_top = win_top + int(win_height * 0.10)
-            chat_bottom = win_bottom - int(win_height * 0.08)
-        except Exception as e:
-            self._debug("获取窗口位置失败: %s" % e)
-            return []
-
-        # 策略1: 全控件递归 + 多模式文本获取
-        texts = []
-        self._collect_all_texts(window, chat_left, chat_top, chat_bottom, texts,
-                                depth=0, max_depth=20)
-
-        if not texts:
-            # 策略2: 全窗口搜索（不限制区域）
-            self._collect_all_texts(window, win_left, win_top, win_bottom, texts,
-                                    depth=0, max_depth=20, unrestricted=True)
-
-        if not texts:
-            # 策略3: 找 DocumentControl 并尝试获取全文
-            self._collect_from_document(window, texts)
-
-        if not texts:
-            # 策略4: 按控件类型专门搜索 Text/Edit/Document
-            self._collect_by_type(window, win_left, win_top, win_bottom, texts,
-                                   depth=0, max_depth=20)
-
-        if not texts:
-            return []
-
-        if self._scan_count <= 3:
-            self._debug("找到 %d 个带文本的控件" % len(texts))
-
-        # 按 Y 排序
-        texts.sort(key=lambda t: (t[0], t[1]))
-
-        # 过滤左侧好友列表区域的文字
-        chat_texts = [
-            t for t in texts
-            if t[1] >= chat_left - 50  # left 坐标在聊天区域内
-        ]
-
-        if not chat_texts:
-            chat_texts = texts  # 全用
-
-        # 分组：按 Y 距离（同一行）
-        groups = []
-        current = []
-        last_y = None
-        for entry in chat_texts:
-            y, x, text, h = entry
-            if last_y is None or abs(y - last_y) <= max(h, 16) * 0.7:
-                current.append(entry)
-            else:
-                if current:
-                    groups.append(current)
-                current = [entry]
-            last_y = y
-        if current:
-            groups.append(current)
-
-        # 合并相邻行为一条消息
-        merged = []
-        cur_msg = []
-        last_bottom = None
-        for grp in groups:
-            grp.sort(key=lambda t: t[1])
-            gy = grp[0][0]
-            gh = grp[0][3] if grp else 16
-            gbot = gy + gh
-
-            if last_bottom is None:
-                cur_msg.append(grp)
-            else:
-                gap = gy - last_bottom
-                if gap <= gh * 1.5:
-                    cur_msg.append(grp)
-                else:
-                    merged.append(cur_msg)
-                    cur_msg = [grp]
-            last_bottom = max(last_bottom or 0, gbot)
-        if cur_msg:
-            merged.append(cur_msg)
-
-        # 生成消息
-        for msg_lines in merged:
-            parts = []
-            fx = None
-            fy = None
-            for line in msg_lines:
-                line.sort(key=lambda t: t[1])
-                parts.append(" ".join(t[2] for t in line))
-                if fx is None:
-                    fx = line[0][1]
-                    fy = line[0][0]
-
-            full = "\n".join(parts).strip()
-            cleaned = self._clean(full)
-            if not cleaned or len(cleaned) < 2:
-                continue
-
-            low = cleaned.lower()
-            skip = ["typing", "online", "last seen", "search", "unread",
-                    "archived", "pinned", "muted", "whatsapp", "type a message",
-                    "messages", "status", "communities", "chats", "settings",
-                    "calls", "new chat"]
-            if any(kw in low for kw in skip):
-                continue
-
-            # 过滤纯数字/时间/特殊字符
-            if all(c.isdigit() or c in ":.,!? " for c in cleaned) and len(cleaned) < 10:
-                continue
-
-            # 过滤太短的疑似 UI 元素
-            if len(cleaned) < 2:
-                continue
-
-            direction = "in" if (fx is not None and fx < mid_x) else "out"
-            messages.append(WhatsAppMessage(text=cleaned, direction=direction, y_top=fy or 0))
-
-        return messages
-
-    def _collect_all_texts(self, ctrl, chat_left, chat_top, chat_bottom,
-                            texts, depth=0, max_depth=20, unrestricted=False):
-        """递归收集所有有文本的控件（不限类型）。"""
-        if depth > max_depth:
-            return
-        try:
-            children = ctrl.GetChildren()
-        except Exception:
-            return
-
-        for child in children:
-            try:
-                rect = child.BoundingRectangle
-
-                in_zone = unrestricted or (
-                    rect.left >= chat_left - 50 and
-                    rect.top >= chat_top - 30 and
-                    rect.bottom <= chat_bottom + 30
-                )
-
-                if in_zone:
-                    text = self._get_control_text(child)
-                    if text and 1 <= len(text) <= 500:
-                        h = rect.height() if rect.height() > 0 else 16
-                        texts.append((rect.top, rect.left, text, h))
-
-                # 递归子控件
-                self._collect_all_texts(child, chat_left, chat_top, chat_bottom,
-                                        texts, depth + 1, max_depth, unrestricted)
-            except Exception:
-                continue
-
-    def _collect_from_document(self, ctrl, texts):
-        """专门找 DocumentControl 并获取全文。"""
-        try:
-            ctype = (ctrl.ControlTypeName or "")
-            if ctype == "DocumentControlType":
-                text = self._get_control_text(ctrl)
-                if text and len(text) > 10:
-                    try:
-                        rect = ctrl.BoundingRectangle
-                        h = rect.height() if rect.height() > 0 else 16
-                        # Document 的全文按行拆分
-                        for i, line in enumerate(text.split("\n")):
-                            line = line.strip()
-                            if line:
-                                texts.append((rect.top + i * 20, rect.left, line, h))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        try:
-            for child in ctrl.GetChildren():
-                self._collect_from_document(child, texts)
-        except Exception:
-            pass
-
-    def _collect_by_type(self, ctrl, win_left, win_top, win_bottom,
-                          texts, depth=0, max_depth=20):
-        """按控件类型收集文本（Text/Edit/Document/Custom）。"""
-        if depth > max_depth:
-            return
-        try:
-            ctype = ctrl.ControlTypeName or ""
-            if ctype in ["TextControlType", "EditControlType", "DocumentControlType", "CustomControlType"]:
-                try:
-                    text = self._get_control_text(ctrl)
-                    if text and 1 <= len(text) <= 500:
-                        rect = ctrl.BoundingRectangle
-                        h = rect.height() if rect.height() > 0 else 16
-                        texts.append((rect.top, rect.left, text, h))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            for child in ctrl.GetChildren():
-                self._collect_by_type(child, win_left, win_top, win_bottom,
-                                       texts, depth + 1, max_depth)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _get_control_text(ctrl) -> str:
-        """尝试多种方式获取控件文本。"""
-        # 1. Name 属性
-        try:
-            name = (ctrl.Name or "").strip()
-            if name:
-                return name
-        except Exception:
-            pass
-
-        # 2. ValuePattern
-        try:
-            if hasattr(ctrl, 'GetValuePattern'):
-                val = ctrl.GetValuePattern().Value
-                val = (val or "").strip()
-                if val:
-                    return val
-        except Exception:
-            pass
-
-        # 3. TextPattern
-        try:
-            if hasattr(ctrl, 'GetTextPattern'):
-                tp = ctrl.GetTextPattern()
-                if tp:
-                    val = tp.DocumentRange.GetText(-1)
-                    val = (val or "").strip()
-                    if val:
-                        return val
-        except Exception:
-            pass
-
-        # 4. LegacyIAccessible
-        try:
-            if hasattr(ctrl, 'GetLegacyIAccessiblePattern'):
-                lap = ctrl.GetLegacyIAccessiblePattern()
-                if lap:
-                    val = (lap.Value or "").strip()
-                    if val:
-                        return val
-                    val = (lap.Name or "").strip()
-                    if val:
-                        return val
-        except Exception:
-            pass
-
-        # 5. RangeValuePattern
-        try:
-            if hasattr(ctrl, 'GetRangeValuePattern'):
-                rv = ctrl.GetRangeValuePattern()
-                if rv and rv.Value is not None:
-                    val = str(rv.Value).strip()
-                    if val:
-                        return val
-        except Exception:
-            pass
-
-        # 6. 尝试获取子控件的文本（拼接）
-        try:
-            children = ctrl.GetChildren()
-            if len(children) > 0 and len(children) <= 30:
-                parts = []
-                for c in children:
-                    try:
-                        t = (c.Name or "").strip()
-                        if t and 1 <= len(t) <= 100:
-                            parts.append(t)
-                    except Exception:
-                        continue
-                if parts and len(parts) >= 2:
-                    combined = " ".join(parts)
-                    if len(combined) <= 500:
-                        return combined
-        except Exception:
-            pass
-
-        return ""
-
-    # -------------------- 提取消息（OCR 兜底方式） --------------------
-    def _extract_messages_ocr(self, window) -> List[WhatsAppMessage]:
-        """用 OCR 识别聊天区域的文字。"""
-        try:
-            import mss  # type: ignore
+            import mss
             from PIL import Image
         except ImportError:
+            self._debug("缺少截图依赖")
             return []
 
         try:
-            from ocr_engine import ocr_image_with_data
+            from ocr_engine import ocr_image_with_data, is_available
         except ImportError:
+            self._debug("OCR 引擎不可用")
             return []
 
+        if not is_available():
+            if self._scan_count % 30 == 0:
+                self._debug("OCR 引擎未就绪")
+            return []
+
+        width = right - left
+        height = bottom - top
+
+        # WhatsApp 聊天区域布局：
+        # - 左侧：好友列表（约占 30% 宽度）
+        # - 右侧：聊天区域（约占 70% 宽度）
+        # - 顶部：标题栏（约占 8% 高度）
+        # - 底部：输入框（约占 10% 高度）
+
+        chat_left = left + int(width * 0.32)
+        chat_top = top + int(height * 0.08)
+        chat_right = right - int(width * 0.03)
+        chat_bottom = bottom - int(height * 0.10)
+
+        # 确保区域有效
+        if chat_right - chat_left < 150 or chat_bottom - chat_top < 100:
+            if self._scan_count % 30 == 0:
+                self._debug("聊天区域太小: %dx%d" % (chat_right - chat_left, chat_bottom - chat_top))
+            return []
+
+        # 截取聊天区域
         try:
-            win_rect = window.BoundingRectangle
-            win_left = win_rect.left
-            win_right = win_rect.right
-            win_top = win_rect.top
-            win_bottom = win_rect.bottom
-            win_width = win_right - win_left
-            win_height = win_bottom - win_top
-
-            # 聊天区域：右侧约 65% 宽度，去掉顶部标题栏和底部输入框
-            chat_left = win_left + int(win_width * 0.32)
-            chat_top = win_top + int(win_height * 0.08)
-            chat_bottom = win_bottom - int(win_height * 0.12)
-            chat_right = win_right - int(win_width * 0.03)
-            mid_x = chat_left + (chat_right - chat_left) // 2
-
-            if chat_right - chat_left < 100 or chat_bottom - chat_top < 100:
-                return []
-
-            # 截取聊天区域
             with mss.mss() as sct:
                 monitor = {
                     "left": chat_left,
@@ -710,124 +330,131 @@ class WhatsAppReader:
                 }
                 raw = sct.grab(monitor)
                 img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-
-            # OCR 识别
-            try:
-                ocr_data = ocr_image_with_data(img, languages=["en", "zh-Hans"])
-            except Exception:
-                # 纯英文试试
-                try:
-                    ocr_data = ocr_image_with_data(img, languages=["en"])
-                except Exception as e:
-                    if self._scan_count % 30 == 0:
-                        self._debug("OCR 识别失败: %s" % e)
-                    return []
-
-            # 解析 OCR 结果
-            n_boxes = len(ocr_data['text'])
-            lines = {}
-
-            for i in range(n_boxes):
-                text = (ocr_data['text'][i] or "").strip()
-                if not text:
-                    continue
-                conf = int(ocr_data['conf'][i])
-                if conf < 30:
-                    continue
-                top = ocr_data['top'][i]
-                left = ocr_data['left'][i]
-                height = ocr_data['height'][i]
-                width = ocr_data['width'][i]
-                # 用 (top, height) 来分组行
-                line_key = round(top / max(height, 10))
-                if line_key not in lines:
-                    lines[line_key] = []
-                lines[line_key].append((top, left, text, height, width))
-
-            # 按行排序并合并
-            sorted_keys = sorted(lines.keys())
-            all_lines = []
-            for key in sorted_keys:
-                entries = lines[key]
-                entries.sort(key=lambda e: e[1])
-                line_text = " ".join(e[2] for e in entries)
-                avg_top = sum(e[0] for e in entries) / len(entries)
-                avg_h = sum(e[3] for e in entries) / len(entries)
-                min_left = min(e[1] for e in entries)
-                all_lines.append((avg_top, min_left, line_text, avg_h))
-
-            all_lines.sort(key=lambda l: l[0])
-
-            # 分组为消息（按垂直距离和左右位置判断气泡）
-            messages: List[WhatsAppMessage] = []
-            cur_lines = []
-            last_top = None
-            last_h = None
-            last_side = None  # "left" | "right"
-
-            for top, left, text, h in all_lines:
-                cleaned = self._clean(text)
-                if not cleaned or len(cleaned) < 2:
-                    continue
-
-                low = cleaned.lower()
-                skip = ["typing", "online", "last seen", "search", "unread",
-                        "archived", "pinned", "muted", "whatsapp", "type a message",
-                        "messages", "status", "communities", "chats", "settings",
-                        "calls", "new chat", "you", "delivered", "read", "sent"]
-                if any(kw in low for kw in skip):
-                    continue
-
-                if all(c.isdigit() or c in ":.,!? " for c in cleaned) and len(cleaned) < 10:
-                    continue
-
-                # 判断在左还是右
-                chat_region_w = chat_right - chat_left
-                side = "left" if left < chat_region_w * 0.5 else "right"
-
-                if last_top is None:
-                    cur_lines = [(top, left, cleaned, h)]
-                    last_top = top
-                    last_h = h
-                    last_side = side
-                else:
-                    gap = top - (last_top + last_h)
-                    # 同一气泡：间距小且同侧
-                    if gap <= (last_h or 16) * 1.8 and side == last_side:
-                        cur_lines.append((top, left, cleaned, h))
-                        last_top = top
-                        last_h = h
-                    else:
-                        # 新气泡
-                        if cur_lines:
-                            msg_text = "\n".join(l[2] for l in cur_lines)
-                            fy = cur_lines[0][0] + chat_top
-                            fx = cur_lines[0][1] + chat_left
-                            direction = "in" if fx < mid_x else "out"
-                            messages.append(WhatsAppMessage(
-                                text=msg_text, direction=direction, y_top=fy
-                            ))
-                        cur_lines = [(top, left, cleaned, h)]
-                        last_top = top
-                        last_h = h
-                        last_side = side
-
-            # 最后一组
-            if cur_lines:
-                msg_text = "\n".join(l[2] for l in cur_lines)
-                fy = cur_lines[0][0] + chat_top
-                fx = cur_lines[0][1] + chat_left
-                direction = "in" if fx < mid_x else "out"
-                messages.append(WhatsAppMessage(
-                    text=msg_text, direction=direction, y_top=fy
-                ))
-
-            return messages
-
         except Exception as e:
-            if self._scan_count % 30 == 0:
-                self._debug("OCR 提取异常: %s" % e)
+            self._debug("截图失败: %s" % e)
             return []
+
+        # OCR 识别
+        try:
+            ocr_data = ocr_image_with_data(img, languages=["en", "zh-Hans"])
+        except Exception as e:
+            if self._scan_count % 20 == 0:
+                self._debug("OCR 识别失败: %s" % e)
+            return []
+
+        n_boxes = len(ocr_data['text'])
+        if n_boxes == 0:
+            return []
+
+        # 解析 OCR 结果，按行分组
+        lines = {}
+        for i in range(n_boxes):
+            text = (ocr_data['text'][i] or "").strip()
+            if not text:
+                continue
+            conf = int(ocr_data['conf'][i])
+            if conf < 25:
+                continue
+
+            top = ocr_data['top'][i]
+            left_in_img = ocr_data['left'][i]
+            height = ocr_data['height'][i]
+            width_in_img = ocr_data['width'][i]
+
+            # 按行分组（同一行的文字会很接近）
+            line_key = round(top / max(height, 12))
+            if line_key not in lines:
+                lines[line_key] = []
+            lines[line_key].append((top, left_in_img, text, height, width_in_img))
+
+        # 合并每行的文字
+        sorted_keys = sorted(lines.keys())
+        all_lines = []
+        chat_region_w = chat_right - chat_left
+
+        for key in sorted_keys:
+            entries = lines[key]
+            entries.sort(key=lambda e: e[1])
+            line_text = " ".join(e[2] for e in entries)
+            avg_top = sum(e[0] for e in entries) / len(entries)
+            avg_h = sum(e[3] for e in entries) / len(entries)
+            min_left = min(e[1] for e in entries)
+            max_right = max(e[1] + e[4] for e in entries)
+
+            # 判断消息方向：
+            # 收到的消息（in）：左对齐，气泡在左侧
+            # 发送的消息（out）：右对齐，气泡在右侧
+            center_x = chat_region_w // 2
+            is_right = max_right > center_x and min_left > chat_region_w * 0.3
+            direction = "out" if is_right else "in"
+
+            all_lines.append((avg_top, min_left, line_text, avg_h, direction))
+
+        all_lines.sort(key=lambda l: l[0])
+
+        # 合并相邻行为完整消息
+        messages: List[WhatsAppMessage] = []
+        cur_lines = []
+        last_top = None
+        last_h = None
+        last_dir = None
+
+        for top, left_in_img, text, h, direction in all_lines:
+            cleaned = self._clean(text)
+            if not cleaned or len(cleaned) < 2:
+                continue
+
+            # 过滤 UI 元素和无意义文字
+            low = cleaned.lower()
+            skip = [
+                "typing", "online", "last seen", "search", "unread",
+                "archived", "pinned", "muted", "whatsapp", "type a message",
+                "messages", "status", "communities", "chats", "settings",
+                "calls", "new chat", "you", "delivered", "read", "sent",
+                "minimize", "maximize", "close", "adjust", "appwindow",
+                "custom title bar", "bar"
+            ]
+            if any(kw in low for kw in skip):
+                continue
+
+            # 过滤纯数字/时间/特殊字符
+            if all(c.isdigit() or c in ":.,!? " for c in cleaned) and len(cleaned) < 10:
+                continue
+
+            # 判断是否同一消息的延续
+            is_continue = False
+            if last_top is not None:
+                gap = top - (last_top + last_h)
+                # 同一消息：间距小且方向相同
+                if gap <= (last_h or 16) * 1.5 and direction == last_dir:
+                    is_continue = True
+
+            if is_continue:
+                cur_lines.append(cleaned)
+            else:
+                if cur_lines:
+                    msg_text = "\n".join(cur_lines)
+                    fy = last_top + chat_top
+                    fx = left_in_img + chat_left
+                    messages.append(WhatsAppMessage(
+                        text=msg_text, direction=last_dir, y_top=fy
+                    ))
+                cur_lines = [cleaned]
+
+            last_top = top
+            last_h = h
+            last_dir = direction
+
+        # 最后一条消息
+        if cur_lines:
+            msg_text = "\n".join(cur_lines)
+            fy = last_top + chat_top if last_top else chat_top
+            fx = left_in_img + chat_left
+            messages.append(WhatsAppMessage(
+                text=msg_text, direction=last_dir or "in", y_top=fy
+            ))
+
+        return messages
 
     @staticmethod
     def _clean(text: str) -> str:

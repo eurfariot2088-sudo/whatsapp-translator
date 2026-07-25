@@ -4,6 +4,7 @@
 # UI Automation - 自动读取 WhatsApp 窗口消息（不截屏）
 uiautomation>=2.0.18
 comtypes>=1.2.0
+pywin32>=306
 
 # 翻译后端
 deep-translator>=1.11.4
