@@ -87,20 +87,68 @@ class WhatsAppReader:
     def probe_controls(self):
         """探测 WhatsApp 窗口信息，输出到调试日志。"""
         self._debug("[探测] === 开始探测 WhatsApp 窗口 ===")
+
+        # 检查 OCR 引擎
+        self._debug("[探测] === OCR 引擎状态 ===")
+        try:
+            from ocr_engine import is_available, get_backend_name
+            if is_available():
+                self._debug("[探测] OCR 引擎可用: %s" % get_backend_name())
+            else:
+                self._debug("[探测] OCR 引擎不可用！请检查：")
+                self._debug("[探测]   - 是否 Windows 10/11 系统？")
+                self._debug("[探测]   - 是否安装了 OCR 语言包？")
+                self._debug("[探测]   - winsdk 是否安装？")
+        except Exception as e:
+            self._debug("[探测] OCR 检查失败: %s" % e)
+
+        # 查找窗口
         hwnd = self._find_whatsapp_window()
         if hwnd == 0:
             self._debug("[探测] 未找到 WhatsApp 窗口")
+            # 列出所有可见窗口供调试
+            self._debug("[探测] === 所有可见窗口 ===")
+            import win32gui
+            import psutil
+            import os
+            current_pid = os.getpid()
+
+            def list_callback(hwnd, lparam):
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                title = win32gui.GetWindowText(hwnd)
+                if not title:
+                    return True
+                tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
+                is_self = pid == current_pid
+                try:
+                    proc = psutil.Process(pid)
+                    pname = proc.name()
+                except Exception:
+                    pname = "unknown"
+                self._debug("[探测]   标题: '%s' | 进程: %s | 句柄: 0x%08X | 自己: %s" %
+                            (title, pname, hwnd, is_self))
+                return True
+
+            win32gui.EnumWindows(list_callback, 0)
         else:
             import win32gui
             import win32con
             title = win32gui.GetWindowText(hwnd)
             rect = win32gui.GetWindowRect(hwnd)
+            tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
             self._debug("[探测] 窗口句柄: 0x%08X" % hwnd)
             self._debug("[探测] 窗口标题: '%s'" % title)
             self._debug("[探测] 窗口位置: (%d,%d) 大小: %dx%d" %
                         (rect[0], rect[1], rect[2]-rect[0], rect[3]-rect[1]))
+            try:
+                import psutil
+                proc = psutil.Process(pid)
+                self._debug("[探测] 进程名: %s (PID: %d)" % (proc.name(), pid))
+            except Exception:
+                pass
 
-            # 查找子窗口（找 WebView/Chrome 容器）
+            # 查找子窗口
             self._debug("[探测] === 查找子窗口 ===")
             self._enum_child_windows(hwnd, depth=0, max_depth=4)
 
@@ -216,12 +264,42 @@ class WhatsAppReader:
         import win32gui
         import win32con
         import psutil
+        import os
 
-        # 策略1: 按标题关键词查找（最常见）
+        current_pid = os.getpid()
+
+        # 策略1: 优先按进程名查找（最可靠，不会找到自己）
         def callback1(hwnd, lparam):
             if not win32gui.IsWindowVisible(hwnd):
                 return True
+            if not win32gui.GetWindowText(hwnd):
+                return True
+            tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
+            if pid == current_pid:
+                return True
+            try:
+                proc = psutil.Process(pid)
+                pname = proc.name().lower()
+                if self.cfg.process_name.lower() in pname:
+                    lparam[0] = hwnd
+                    return False
+            except Exception:
+                pass
+            return True
+
+        result = [0]
+        win32gui.EnumWindows(callback1, result)
+        if result[0] != 0:
+            return result[0]
+
+        # 策略2: 按标题关键词查找，但排除自己的窗口
+        def callback2(hwnd, lparam):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
             if not win32gui.IsWindowEnabled(hwnd):
+                return True
+            tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
+            if pid == current_pid:
                 return True
             title = win32gui.GetWindowText(hwnd).lower()
             if self.cfg.window_keyword.lower() in title:
@@ -230,36 +308,18 @@ class WhatsAppReader:
             return True
 
         result = [0]
-        win32gui.EnumWindows(callback1, result)
-        if result[0] != 0:
-            return result[0]
-
-        # 策略2: 按进程名查找
-        def callback2(hwnd, lparam):
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            if not win32gui.GetWindowText(hwnd):
-                return True
-            tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
-            try:
-                proc = psutil.Process(pid)
-                if self.cfg.process_name.lower() in proc.name().lower():
-                    lparam[0] = hwnd
-                    return False
-            except Exception:
-                pass
-            return True
-
-        result = [0]
         win32gui.EnumWindows(callback2, result)
         if result[0] != 0:
             return result[0]
 
         # 策略3: 按类名查找（Electron/Chrome 类名）
-        class_names = ["Chrome_WidgetWin_1", "Qt51514QWindowIcon"]
+        class_names = ["Chrome_WidgetWin_1", "Qt51514QWindowIcon", "Chrome_WidgetWin_0"]
         for cls in class_names:
             hwnd = win32gui.FindWindow(cls, None)
             if hwnd != 0:
+                tid, pid = win32gui.GetWindowThreadProcessId(hwnd)
+                if pid == current_pid:
+                    continue
                 title = win32gui.GetWindowText(hwnd)
                 if self.cfg.window_keyword.lower() in title.lower():
                     return hwnd
