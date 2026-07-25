@@ -22,12 +22,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装 Tesseract-OCR
-        shell: pwsh
-        run: |
-          choco install tesseract -y
-          echo "C:\Program Files\Tesseract-OCR" >> $env:GITHUB_PATH
-
       - name: 安装依赖
         shell: pwsh
         run: |
@@ -50,7 +44,8 @@ jobs:
             --collect-all requests `
             --collect-all yaml `
             --collect-all mss `
-            --collect-all pytesseract `
+            --collect-all winsdk `
+            --collect-all psutil `
             --exclude-module matplotlib `
             --exclude-module numpy `
             --exclude-module scipy `
