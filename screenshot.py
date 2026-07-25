@@ -2,7 +2,10 @@
 screenshot.py
 截图翻译模块。
 
-v5：
+v7：
+- 使用 ocr_engine 模块（Windows 内置 OCR 优先，Tesseract 备选，无需安装）
+- 修复黑屏：所有 PhotoImage 引用挂到 overlay 上防止 GC 回收
+- 微信式半透明遮罩：全屏原始图 + 深色蒙层，选区内清晰可见
 - 不关闭/隐藏主窗口
 - 截图选框后打开独立新窗口显示截图内容
 - 在新窗口中直接进行 OCR + 翻译，实时更新结果
@@ -14,43 +17,15 @@ import logging
 import threading
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 log = logging.getLogger(__name__)
 
-_TESSERACT_PATHS = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-]
-
-
-def _find_tesseract() -> Optional[str]:
-    import os
-    for p in os.environ.get("PATH", "").split(os.pathsep):
-        exe = os.path.join(p, "tesseract.exe")
-        if os.path.isfile(exe):
-            return exe
-    for p in _TESSERACT_PATHS:
-        if os.path.isfile(p):
-            return p
-    return None
-
 
 def ocr_image(image: Image.Image) -> str:
-    """OCR 识别图片中的文字。"""
-    import pytesseract  # type: ignore
-    path = _find_tesseract()
-    if path:
-        pytesseract.pytesseract.tesseract_cmd = path
-    try:
-        text = pytesseract.image_to_string(image, lang="eng+chi_sim")
-    except Exception as e:
-        raise RuntimeError(
-            f"OCR 识别失败: {e}\n\n"
-            "请确保已安装 Tesseract-OCR 引擎。\n"
-            "下载地址: https://github.com/UB-Mannheim/tesseract/wiki"
-        )
-    return text.strip()
+    """OCR 识别图片中的文字（自动选择可用后端）。"""
+    from ocr_engine import ocr_image as _ocr
+    return _ocr(image, languages=["en", "zh-Hans"])
 
 
 def capture_fullscreen() -> Image.Image:
@@ -63,12 +38,20 @@ def capture_fullscreen() -> Image.Image:
     return img
 
 
+def _make_dark_overlay(image: Image.Image, opacity: int = 140) -> Image.Image:
+    """在截图上叠加一层深色半透明蒙层，模拟微信截图效果。"""
+    dark = Image.new("RGBA", image.size, (0, 0, 0, opacity))
+    base = image.convert("RGBA")
+    return Image.alpha_composite(base, dark)
+
+
 # ============================================================================
 # 选区选择器（必须在主线程调用，不隐藏主窗口）
 # ============================================================================
 def show_region_selector(parent_tk, callback):
     """
     显示全屏选区窗口。不隐藏主窗口。
+    微信式效果：全屏深色半透明蒙层，选区内清晰显示原图。
 
     :param parent_tk: 父 tkinter 窗口（保持可见）
     :param callback: 选区完成后调用 callback(cropped_image: Image.Image)
@@ -78,7 +61,7 @@ def show_region_selector(parent_tk, callback):
 
     # 1. 截屏（不隐藏主窗口，全屏选区窗口会覆盖在最上层）
     import time
-    time.sleep(0.1)
+    time.sleep(0.15)
 
     try:
         screen_img = capture_fullscreen()
@@ -87,7 +70,7 @@ def show_region_selector(parent_tk, callback):
         return
 
     # 2. 创建全屏选区窗口
-    overlay = tk.Toplevel()
+    overlay = tk.Toplevel(parent_tk)
     overlay.attributes("-fullscreen", True)
     overlay.attributes("-topmost", True)
     overlay.configure(cursor="crosshair")
@@ -100,50 +83,75 @@ def show_region_selector(parent_tk, callback):
                        highlightthickness=0, bd=0, bg="#000000")
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    # 直接显示原始截图，清晰可见
-    tk_img = ImageTk.PhotoImage(screen_img)
-    canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+    # 生成带深色蒙层的背景图（微信式半透明效果）
+    dark_img = _make_dark_overlay(screen_img, opacity=120)
+    tk_dark = ImageTk.PhotoImage(dark_img)
+    canvas.create_image(0, 0, anchor=tk.NW, image=tk_dark)
 
-    # 保存原始截图用于选区内显示
-    tk_orig = ImageTk.PhotoImage(screen_img)
+    # 把 PhotoImage 引用挂到 overlay 上，防止 GC 回收（关键！）
+    overlay._tk_dark = tk_dark
+    overlay._screen_img = screen_img
 
     # 提示
-    canvas.create_text(
+    tip_id = canvas.create_text(
         screen_w // 2, 40,
         text="拖动鼠标选择要翻译的区域 | 按 ESC 取消",
-        fill="red", font=("Microsoft YaHei", 18, "bold"),
+        fill="#FFFFFF", font=("Microsoft YaHei", 16, "bold"),
     )
 
     # 状态
-    state = {"start_x": 0, "start_y": 0, "rect_id": None, "orig_id": None}
+    state = {
+        "start_x": 0, "start_y": 0,
+        "clear_id": None,     # 选区内清晰截图
+        "rect_id": None,      # 选区边框
+        "tip_hidden": False,
+    }
 
     def on_press(event):
         state["start_x"] = event.x
         state["start_y"] = event.y
+
         if state["rect_id"]:
             canvas.delete(state["rect_id"])
-        if state["orig_id"]:
-            canvas.delete(state["orig_id"])
-        state["orig_id"] = canvas.create_image(event.x, event.y, anchor=tk.NW, image=tk_orig)
+            state["rect_id"] = None
+        if state["clear_id"]:
+            canvas.delete(state["clear_id"])
+            state["clear_id"] = None
+
+        # 隐藏提示文字
+        if not state["tip_hidden"]:
+            canvas.itemconfigure(tip_id, state="hidden")
+            state["tip_hidden"] = True
+
         state["rect_id"] = canvas.create_rectangle(
             event.x, event.y, event.x, event.y,
-            outline="#FF0000", width=2,
+            outline="#07C160", width=2,
         )
-        canvas.tag_raise(state["rect_id"])
 
     def on_drag(event):
         x1 = min(state["start_x"], event.x)
         y1 = min(state["start_y"], event.y)
         x2 = max(state["start_x"], event.x)
         y2 = max(state["start_y"], event.y)
+
+        # 更新选区边框
         if state["rect_id"]:
             canvas.coords(state["rect_id"], x1, y1, x2, y2)
-        if state["orig_id"]:
-            crop = screen_img.crop((x1, y1, x2, y2))
-            crop_tk = ImageTk.PhotoImage(crop)
-            canvas.delete(state["orig_id"])
-            state["orig_id"] = canvas.create_image(x1, y1, anchor=tk.NW, image=crop_tk)
-            state["crop_tk"] = crop_tk
+
+        # 更新选区内的清晰原图（裁一块贴上去，覆盖在深色蒙层之上）
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        crop = screen_img.crop((x1, y1, x1 + w, y1 + h))
+        crop_tk = ImageTk.PhotoImage(crop)
+
+        if state["clear_id"]:
+            canvas.delete(state["clear_id"])
+        state["clear_id"] = canvas.create_image(x1, y1, anchor=tk.NW, image=crop_tk)
+        # 把引用存到 state 里防止 GC
+        state["_crop_tk"] = crop_tk
+
+        # 边框始终在最上层
+        if state["rect_id"]:
             canvas.tag_raise(state["rect_id"])
 
     def on_release(event):
@@ -300,7 +308,7 @@ def start_screenshot_translate(parent_tk, translator, target_lang: str):
     启动截图翻译（在主线程调用）。
 
     流程：
-    1. 显示全屏选区窗口（主窗口保持可见）
+    1. 显示全屏选区窗口（主窗口保持可见，微信式半透明遮罩）
     2. 用户选区后，打开独立结果窗口显示截图
     3. 子线程中 OCR + 翻译，实时更新结果窗口
     """

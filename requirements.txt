@@ -23,9 +23,12 @@ pyyaml>=6.0.1
 # 截图翻译 - 快速截屏
 mss>=9.0.1
 
-# OCR 文字识别（截图翻译用）
-# 注意：还需要安装 Tesseract-OCR 引擎本身
-# 下载地址：https://github.com/UB-Mannheim/tesseract/wiki
-# 安装后需要将 tesseract.exe 路径加入 PATH 或在设置中指定路径
-pytesseract>=0.3.10
+# Windows 内置 OCR 调用（Win10/11 系统自带，无需额外安装）
+# 用于截图翻译和消息自动识别兜底
+winsdk>=1.0.0b10
 
+# 系统进程/窗口管理（窗口定位用）
+psutil>=5.9.0
+
+# Tesseract OCR（可选，如果系统安装了 Tesseract 也可以用）
+# pytesseract>=0.3.10
