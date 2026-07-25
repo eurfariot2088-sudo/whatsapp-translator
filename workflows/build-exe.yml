@@ -35,10 +35,27 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: 打包（onedir 模式，更稳定）
+      - name: 打包（onedir 模式）
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean WhatsAppTranslator.spec
+          pyinstaller --noconfirm --clean `
+            --name "WhatsAppTranslator" `
+            --windowed `
+            --collect-all deep_translator `
+            --collect-all pystray `
+            --collect-all PIL `
+            --collect-all keyboard `
+            --collect-all uiautomation `
+            --collect-all comtypes `
+            --collect-all requests `
+            --collect-all yaml `
+            --collect-all mss `
+            --collect-all pytesseract `
+            --exclude-module matplotlib `
+            --exclude-module numpy `
+            --exclude-module scipy `
+            --exclude-module pandas `
+            main.py
 
       - name: 验证产物
         shell: pwsh
